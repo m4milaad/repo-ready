@@ -13,7 +13,7 @@ import os
 import stat
 import tomllib
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Iterable, Iterator
 
 
@@ -24,6 +24,16 @@ DEFAULT_EXCLUDES: tuple[str, ...] = (
     "node_modules", "__pycache__", ".pytest_cache", ".mypy_cache",
     ".ruff_cache", ".hypothesis", "dist", "build", "coverage",
 )
+
+
+class ConfigError(ValueError):
+    """Raised when the root ``.repo-ready.toml`` is invalid."""
+
+
+@dataclass(frozen=True)
+class _RepoConfig:
+    excludes: tuple[str, ...] = ()
+    min_score: int | None = None
 
 
 @dataclass(frozen=True)
@@ -109,42 +119,64 @@ class RepoContext:
             candidate = Path(os.path.abspath(os.fspath(candidate)))
         self.root = candidate
         self.max_file_bytes = max(0, int(max_file_bytes))
-        self.min_score = self._read_min_score()
-        self.config_excludes = self._read_config_excludes()
+        config = self._read_config()
+        self.min_score = config.min_score
+        self.config_excludes = config.excludes
         self.excludes = tuple(
             dict.fromkeys((*DEFAULT_EXCLUDES, *self.config_excludes, *excludes))
         )
         self._entries = self._build_index()
         self._by_path = {entry.path: entry for entry in self._entries}
 
-    def _read_config_excludes(self) -> tuple[str, ...]:
+    def _read_config(self) -> _RepoConfig:
         config = self.root / ".repo-ready.toml"
         if not _safe_regular_file(config):
-            return ()
+            return _RepoConfig()
         try:
-            if config.stat().st_size > self.max_file_bytes:
-                return ()
-            raw = config.read_bytes()
-            if b"\x00" in raw:
-                return ()
-            document = tomllib.loads(raw.decode("utf-8", errors="replace"))
-        except (OSError, UnicodeError, tomllib.TOMLDecodeError):
-            return ()
-        values = document.get("exclude") if isinstance(document, dict) else None
-        if not isinstance(values, list):
-            return ()
-        return tuple(value for value in values if isinstance(value, str) and value.strip())
+            text = config.read_text(encoding="utf-8")
+        except UnicodeError as error:
+            raise ConfigError(".repo-ready.toml: configuration must be valid UTF-8.") from error
+        except OSError as error:
+            raise ConfigError(".repo-ready.toml: configuration could not be read.") from error
+        try:
+            document = tomllib.loads(text)
+        except tomllib.TOMLDecodeError as error:
+            line = getattr(error, "lineno", None)
+            column = getattr(error, "colno", None)
+            location = f" at line {line}, column {column}" if line is not None and column is not None else ""
+            raise ConfigError(f".repo-ready.toml: invalid TOML{location}.") from error
 
-    def _read_min_score(self) -> int | None:
-        config = self.root / ".repo-ready.toml"
-        if not _safe_regular_file(config):
-            return None
-        try:
-            document = tomllib.loads(config.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, tomllib.TOMLDecodeError):
-            return None
-        value = document.get("min_score") if isinstance(document, dict) else None
-        return value if isinstance(value, int) and 0 <= value <= 100 else None
+        values = document.get("exclude")
+        if values is not None:
+            if not isinstance(values, list):
+                raise ConfigError(
+                    ".repo-ready.toml: 'exclude' must be a list of non-empty relative path/glob strings."
+                )
+            excludes = []
+            for index, value in enumerate(values):
+                if not isinstance(value, str) or not value.strip():
+                    raise ConfigError(
+                        f".repo-ready.toml: exclude[{index}] must be a non-empty string."
+                    )
+                path_error = _exclude_path_error(value)
+                if path_error is not None:
+                    raise ConfigError(
+                        f".repo-ready.toml: exclude[{index}] {path_error}"
+                    )
+                excludes.append(value)
+        else:
+            excludes = []
+
+        min_score = document.get("min_score")
+        if min_score is not None and (
+            isinstance(min_score, bool)
+            or not isinstance(min_score, int)
+            or not 0 <= min_score <= 100
+        ):
+            raise ConfigError(
+                ".repo-ready.toml: 'min_score' must be an integer from 0 to 100; booleans are not allowed."
+            )
+        return _RepoConfig(tuple(excludes), min_score)
 
     def is_excluded(self, relative: str | Path) -> bool:
         path = _posix_path(relative)
@@ -302,4 +334,27 @@ def _safe_directory(path: Path) -> bool:
 FileIndex = tuple[FileEntry, ...]
 
 
-__all__ = ["DEFAULT_EXCLUDES", "MAX_FILE_BYTES", "FileEntry", "FileIndex", "RepoContext"]
+def _exclude_path_error(value: str) -> str | None:
+    normalized = value.replace("\\", "/")
+    posix = PurePosixPath(normalized)
+    windows = PureWindowsPath(value)
+    if (
+        posix.is_absolute()
+        or windows.is_absolute()
+        or bool(windows.drive)
+        or bool(windows.root)
+    ):
+        return "must be a relative path/glob; absolute paths are not allowed."
+    if ".." in posix.parts:
+        return "must not contain '..' path traversal."
+    return None
+
+
+__all__ = [
+    "ConfigError",
+    "DEFAULT_EXCLUDES",
+    "MAX_FILE_BYTES",
+    "FileEntry",
+    "FileIndex",
+    "RepoContext",
+]

@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .context import RepoContext
+from .context import ConfigError, RepoContext
 from .fixer import PlannedFile, apply_fix_plan, plan_fixes, project_fix_score, protect_score
 from .scoring import report
 
@@ -252,10 +252,14 @@ def main(argv: list[str] | None = None) -> int:
     if repository is None:
         print(f"repo-ready: repository path is not a directory or is unreadable: {supplied_path}", file=sys.stderr)
         return 2
-    if args.command == "check":
-        args.path = supplied_path
-        return _run_check(args, repository)
-    return _run_fix(args, repository)
+    try:
+        if args.command == "check":
+            args.path = supplied_path
+            return _run_check(args, repository)
+        return _run_fix(args, repository)
+    except ConfigError as error:
+        print(f"repo-ready: configuration error: {error}", file=sys.stderr)
+        return 2
 
 
 __all__ = ["main"]
