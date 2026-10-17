@@ -5,6 +5,8 @@ from pathlib import Path
 import pytest
 
 from repo_ready.cli import main
+from repo_ready.detector import detect_ecosystems
+from repo_ready.scoring import CHECK_WEIGHTS, pinned_runtime
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -80,6 +82,44 @@ def test_check_json_rejects_a_runtime_created_absolute_path(
     report = _json_stdout(capsys)
     checks = report["checks"]
     assert checks["no_hardcoded_paths"] is False
+
+
+@pytest.mark.parametrize(
+    "marker",
+    ("pyproject.toml", "requirements.txt", "uv.lock", "poetry.lock"),
+)
+def test_each_python_marker_detects_python(tmp_path: Path, marker: str) -> None:
+    (tmp_path / marker).write_text("marker\n", encoding="utf-8")
+
+    assert detect_ecosystems(tmp_path) == ["python"]
+
+
+@pytest.mark.parametrize("marker", ("package.json", "package-lock.json", ".nvmrc"))
+def test_each_node_marker_detects_node(tmp_path: Path, marker: str) -> None:
+    (tmp_path / marker).write_text("marker\n", encoding="utf-8")
+
+    assert detect_ecosystems(tmp_path) == ["node"]
+
+
+def test_mixed_ecosystems_keep_python_priority(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    (tmp_path / "package.json").write_text("{}\n", encoding="utf-8")
+
+    assert detect_ecosystems(tmp_path) == ["python", "node"]
+
+
+def test_fixed_weights_sum_to_one_hundred() -> None:
+    assert sum(CHECK_WEIGHTS.values()) == 100
+    assert len(CHECK_WEIGHTS) == 10
+
+
+@pytest.mark.parametrize("filename, value", ((".python-version", "latest\n"), (".nvmrc", ">=20\n")))
+def test_runtime_aliases_are_not_pins(
+    tmp_path: Path, filename: str, value: str
+) -> None:
+    (tmp_path / filename).write_text(value, encoding="utf-8")
+
+    assert pinned_runtime(tmp_path) is False
 
 
 def test_fix_dry_run_leaves_minimal_repository_unchanged(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -86,6 +87,43 @@ def _package_lock(root: Path) -> str:
     return json.dumps(document, indent=2) + "\n"
 
 
+def _python_dependencies_exist(root: Path) -> bool:
+    requirements = root / "requirements.txt"
+    try:
+        if any(
+            line.strip() and not line.lstrip().startswith("#")
+            for line in requirements.read_text(encoding="utf-8").splitlines()
+        ):
+            return True
+    except (OSError, UnicodeError):
+        pass
+
+    try:
+        project = tomllib.loads(
+            (root / "pyproject.toml").read_text(encoding="utf-8")
+        ).get("project", {})
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+        return False
+    if not isinstance(project, dict):
+        return False
+    return bool(project.get("dependencies")) or bool(
+        project.get("optional-dependencies")
+    )
+
+
+def _node_dependencies_exist(root: Path) -> bool:
+    try:
+        package = json.loads((root / "package.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(package, dict):
+        return False
+    return any(
+        isinstance(package.get(group), dict) and package[group]
+        for group in ("dependencies", "devDependencies", "optionalDependencies")
+    )
+
+
 def _dockerfile(ecosystems: list[str], root: Path) -> str:
     if "python" in ecosystems:
         version = _python_version(root)
@@ -93,18 +131,16 @@ def _dockerfile(ecosystems: list[str], root: Path) -> str:
             f"FROM python:{version}-slim\n\n"
             "WORKDIR /app\n"
             "COPY . .\n"
-            "RUN python -m unittest discover\n\n"
-            'CMD ["python", "-m", "app"]\n'
+            "\n"
+            'CMD ["python", "-m", "unittest", "discover"]\n'
         )
     if "node" in ecosystems:
         version = _node_version(root)
         return (
             f"FROM node:{version}-slim\n\n"
             "WORKDIR /app\n"
-            "COPY package*.json ./\n"
-            "RUN npm ci --ignore-scripts\n"
             "COPY . .\n\n"
-            'CMD ["npm", "start"]\n'
+            'CMD ["node", "--test"]\n'
         )
     return "FROM debian:bookworm-slim\n\nWORKDIR /app\nCOPY . .\n"
 
@@ -161,8 +197,10 @@ def plan_fixes(root: Path) -> list[PlannedFile]:
     if not issue_files:
         plans.append(PlannedFile(issue_directory / "bug_report.md", _ISSUE_TEMPLATE))
 
-    if "python" in ecosystems and not _first_existing(
-        root, ("uv.lock", "poetry.lock", "requirements.lock")
+    if (
+        "python" in ecosystems
+        and not _first_existing(root, ("uv.lock", "poetry.lock", "requirements.lock"))
+        and not _python_dependencies_exist(root)
     ):
         plans.append(
             PlannedFile(
@@ -170,8 +208,13 @@ def plan_fixes(root: Path) -> list[PlannedFile]:
                 "# Add the resolved Python dependency set here.\n",
             )
         )
-    if "node" in ecosystems and not _first_existing(
-        root, ("package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml")
+    if (
+        "node" in ecosystems
+        and not _first_existing(
+            root,
+            ("package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml"),
+        )
+        and not _node_dependencies_exist(root)
     ):
         plans.append(PlannedFile(root / "package-lock.json", _package_lock(root)))
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import tomllib
 from pathlib import Path
 from typing import Callable, Mapping
 
@@ -125,24 +126,103 @@ def templates(root: Path) -> bool:
 def lockfile(root: Path) -> bool:
     """Check for a lockfile used by a supported ecosystem."""
 
-    return _first_existing_file(
-        root,
-        (
-            "uv.lock",
-            "poetry.lock",
-            "requirements.lock",
-            "package-lock.json",
-            "npm-shrinkwrap.json",
-            "yarn.lock",
-            "pnpm-lock.yaml",
-        ),
-    ) is not None
+    for name in ("uv.lock", "poetry.lock", "yarn.lock", "pnpm-lock.yaml"):
+        if _nonempty_file(root / name):
+            return True
+
+    requirements_lock = root / "requirements.lock"
+    if _nonempty_file(requirements_lock) and _python_lockfile_is_valid(
+        root, requirements_lock
+    ):
+        return True
+
+    package_lock = _first_existing_file(
+        root, ("package-lock.json", "npm-shrinkwrap.json")
+    )
+    return package_lock is not None and _node_lockfile_is_valid(root, package_lock)
+
+
+def _meaningful_requirement_lines(text: str) -> list[str]:
+    return [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
+def _python_project_has_dependencies(root: Path) -> bool:
+    requirements = _read_text(root / "requirements.txt")
+    if requirements is not None and _meaningful_requirement_lines(requirements):
+        return True
+
+    pyproject = _read_text(root / "pyproject.toml")
+    if pyproject is None:
+        return False
+    try:
+        metadata = tomllib.loads(pyproject).get("project", {})
+    except tomllib.TOMLDecodeError:
+        return False
+    if not isinstance(metadata, dict):
+        return False
+    dependencies = metadata.get("dependencies", [])
+    optional = metadata.get("optional-dependencies", {})
+    return bool(dependencies) or bool(optional)
+
+
+def _python_lockfile_is_valid(root: Path, path: Path) -> bool:
+    text = _read_text(path)
+    if text is None:
+        return False
+    if _meaningful_requirement_lines(text):
+        return True
+    return not _python_project_has_dependencies(root)
+
+
+def _node_lockfile_is_valid(root: Path, path: Path) -> bool:
+    lock = _read_json(path)
+    if not isinstance(lock, dict):
+        return False
+    package = _read_json(root / "package.json")
+    if not isinstance(package, dict):
+        return True
+    dependency_groups = (
+        package.get("dependencies", {}),
+        package.get("devDependencies", {}),
+        package.get("optionalDependencies", {}),
+    )
+    declared = {
+        name
+        for group in dependency_groups
+        if isinstance(group, dict)
+        for name in group
+    }
+    if not declared:
+        return True
+    packages = lock.get("packages", {})
+    if isinstance(packages, dict):
+        installed = {
+            str(package_name).removeprefix("node_modules/")
+            for package_name in packages
+            if str(package_name).startswith("node_modules/")
+        }
+        if declared.issubset(installed):
+            return True
+    dependencies = lock.get("dependencies", {})
+    return isinstance(dependencies, dict) and declared.issubset(dependencies)
 
 
 def pinned_runtime(root: Path) -> bool:
     """Check for a supported runtime-version file."""
 
-    return _first_existing_file(root, (".python-version", ".nvmrc")) is not None
+    python_version = _read_text(root / ".python-version")
+    if python_version is not None and re.fullmatch(
+        r"\s*\d+\.\d+(?:\.\d+)?\s*", python_version
+    ):
+        return True
+    node_version = _read_text(root / ".nvmrc")
+    return node_version is not None and bool(
+        re.fullmatch(r"\s*v?\d+(?:\.\d+){0,2}\s*", node_version)
+    )
 
 
 def dockerfile(root: Path) -> bool:
