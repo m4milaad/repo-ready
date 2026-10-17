@@ -98,6 +98,7 @@ def _run_fix(args: argparse.Namespace, repository: Path) -> int:
         print("No safe missing files can be scaffolded.")
     else:
         print(f"{action} {len(completed)} file(s).")
+    print("Skipped existing files: none were overwritten.")
     print("Manual items: lockfiles, test commands, and machine-specific paths require human changes.")
     if args.license_name != "mit" or not args.holder:
         print("Manual item: LICENSE is created only with --license mit --holder NAME.")

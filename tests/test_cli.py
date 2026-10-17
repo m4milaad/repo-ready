@@ -122,6 +122,11 @@ def test_perfect_fixtures_score_100(tmp_path: Path) -> None:
     assert report(copy_fixture(tmp_path, "perfect-node"))["score"] == 100
 
 
+def test_repo_ready_scores_itself_100() -> None:
+    repository = Path(__file__).resolve().parents[1]
+    assert report(repository)["score"] == 100
+
+
 def test_na_checks_earn_their_full_weight(tmp_path: Path) -> None:
     value = report(copy_fixture(tmp_path, "empty-repo"))
     for rule_id in ("RR10",):

@@ -177,6 +177,22 @@ def _dockerfile(ecosystems: list[str], runtime: str) -> str:
     return f"FROM node:{runtime}-slim\n\nWORKDIR /app\nCOPY package*.json ./\nCOPY . .\nCMD [\"npm\", \"test\"]\n"
 
 
+def _ci_workflow(ecosystems: list[str]) -> str:
+    command = "python -m pytest -q" if "python" in ecosystems else "npm test"
+    setup = """      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+""" if "python" in ecosystems else ""
+    return (
+        "name: CI\n\n"
+        "on: [push, pull_request]\n\n"
+        "jobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n"
+        "      - uses: actions/checkout@v4\n"
+        f"{setup}"
+        f"      - run: {command}\n"
+    )
+
+
 def plan_fixes(
     root: str | Path,
     *,
@@ -232,7 +248,7 @@ def plan_fixes(
             lines.append("node_modules")
         add(".gitignore", "\n".join(lines) + "\n", "ecosystem gitignore")
     if not any(entry.path.startswith(".github/workflows/") and entry.size > 0 for entry in context):
-        add(".github/workflows/ci.yml", _CI, "CI workflow")
+        add(".github/workflows/ci.yml", _ci_workflow(ecosystems), "CI workflow")
     return plans
 
 
