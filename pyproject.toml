@@ -8,7 +8,20 @@ version = "0.1.0"
 description = "Offline contributor-readiness and rebuildability scoring for local repositories"
 readme = "README.md"
 requires-python = ">=3.12"
+authors = [{ name = "repo-ready contributors" }]
+license = { file = "LICENSE" }
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/m4milaad/repo-ready"
+Repository = "https://github.com/m4milaad/repo-ready"
+Issues = "https://github.com/m4milaad/repo-ready/issues"
 
 [project.scripts]
 repo-ready = "repo_ready.cli:main"

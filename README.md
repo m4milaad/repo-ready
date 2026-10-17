@@ -8,33 +8,98 @@ configuration files without overwriting anything.
 
 ## Requirements
 
-- Python 3.12 or newer
+- Python 3.12
 - Docker for the clean-image verification command
 
-The runtime uses only the Python standard library. `pytest` is the sole
-development dependency and is pinned in `requirements.lock`.
+The runtime uses only the Python standard library. `pytest` and its locked
+test-tool dependencies are development dependencies listed in
+`requirements.lock`.
 
 ## Setup
 
+### Local installation
+
+From a checkout of `repo-ready`, create a Python 3.12 virtual environment,
+install the locked development tools, and install the package in editable
+mode:
+
 ```sh
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.lock
-.venv/bin/python -m pip install --no-build-isolation -e .
+python3.12 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.lock
+python -m pip install --no-build-isolation -e .
 ```
 
+The editable install makes both invocation styles available:
+
+```sh
+repo-ready check .
+python -m repo_ready check .
+```
+
+`repo-ready` is the installed console script. `python -m repo_ready` invokes
+the same CLI through the package module. Both commands default to the current
+directory when no repository path is supplied.
+
 ## Run
+
+### Check a repository
 
 ```sh
 repo-ready check .
 repo-ready check ./some-repository --json
 repo-ready check . --min-score 80 --no-color
-repo-ready --version
 ```
 
-The path defaults to the current directory. JSON output has stable keys and
-sorted checks/findings for CI. The exit status is 1 when `--min-score` (or the
-`min_score` value in `.repo-ready.toml`) is not met, and 2 for an invalid path
-or usage error.
+JSON output has stable keys and sorted checks/findings for CI. It is written to
+standard output, so it can be saved or passed to another tool:
+
+```sh
+python -m repo_ready check ./some-repository --json --min-score 80 > readiness.json
+```
+
+`--min-score` sets the minimum accepted score for that invocation. If the
+target repository has `min_score` in `.repo-ready.toml`, the command-line value
+takes precedence. The report is still emitted as JSON when the score is below
+the threshold; the exit status communicates the result to CI.
+
+### Exit codes
+
+| Code | Meaning |
+| ---: | --- |
+| `0` | The repository was checked and its score met the configured threshold, or no threshold was configured. |
+| `1` | The repository was checked, but its score was below `--min-score` or `.repo-ready.toml`'s `min_score`. |
+| `2` | The repository path is invalid or unreadable, or command-line usage is invalid. |
+
+### GitHub Actions
+
+The following workflow is a copyable CI example. It runs the required project
+test command and then fails the job if readiness is below the selected score:
+
+```yaml
+name: Repository readiness
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  readiness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install the locked tools and package
+        run: |
+          python -m pip install -r requirements.lock
+          python -m pip install --no-build-isolation -e .
+      - name: Run tests
+        run: python -m pytest -q
+      - name: Check repository readiness
+        run: python -m repo_ready check . --json --min-score 80
+```
 
 The checks are RR01 through RR13: README, LICENSE, CONTRIBUTING, issue and
 pull-request templates, lockfile, pinned runtime, Dockerfile, test command,
@@ -46,6 +111,7 @@ weight and are shown as `na`.
 
 ```sh
 repo-ready fix . --dry-run
+repo-ready fix . --dry-run --json
 repo-ready fix .
 repo-ready fix . --license mit --holder "Project Authors" --runtime-version 3.12
 ```
@@ -54,7 +120,17 @@ repo-ready fix . --license mit --holder "Project Authors" --runtime-version 3.12
 overwrites an existing file, follows a symlink outside the repository, reads
 the interpreter's runtime version, or runs a package manager. Lockfiles, test
 commands, and machine-specific paths are reported as manual work. A dry run
-writes nothing.
+writes nothing. For automation, `--json` returns the operation list and
+separate `created`, `would_create`, `skipped_existing`, `skipped_unsafe`, and
+`manual` collections. In a dry run, `created` is empty and proposed files are
+listed in `would_create`:
+
+```sh
+python -m repo_ready fix . --dry-run --json > fix-plan.json
+```
+
+`fix` returns `0` for a valid repository, including a dry run, and `2` for an
+invalid path or usage error.
 
 ## Test
 
@@ -64,8 +140,7 @@ The one project test command is:
 python -m pytest -q
 ```
 
-The Makefile target is only an alias for that command. Tests use local fixture
-repositories, guard sockets and subprocesses, and do not access the network.
+Tests use local fixture repositories and do not access the network.
 
 ## Rebuild and offline verification
 
@@ -78,6 +153,18 @@ docker run --rm -v "$PWD":/work repo-ready repo-ready check /work --json
 The Docker image has no Make dependency and its default command is
 `python -m pytest -q`. `.dockerignore` keeps local virtual environments,
 caches, and build artifacts out of the build context.
+
+To check a different local repository, build the image from the `repo-ready`
+checkout and mount the target repository at `/work`:
+
+```sh
+docker run --rm --network none \
+  -v "/path/to/another-repository":/work:ro \
+  repo-ready repo-ready check /work --json --min-score 80
+```
+
+The target is read-only and is scanned in the container; no package manager or
+target-repository command is run by `repo-ready`.
 
 ## Configuration
 
