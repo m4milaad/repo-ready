@@ -7,7 +7,7 @@ configuration practices.
 
 ## Requirements
 
-- Python 3.11 or newer
+- Python 3.12 or newer
 - `pytest` for the test suite
 
 The application uses only the Python standard library at runtime. The test
@@ -18,6 +18,7 @@ dependency is pinned in `requirements.lock`.
 ```sh
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.lock
+.venv/bin/python -m pip install --no-build-isolation -e .
 ```
 
 ## Run
@@ -41,7 +42,7 @@ existing files; use `--dry-run` to preview planned changes.
 ## Test
 
 ```sh
-make test
+python -m pytest -q
 ```
 
 The tests use local fixture repositories and do not access the network.
@@ -50,5 +51,5 @@ The tests use local fixture repositories and do not access the network.
 
 ```sh
 docker build -t repo-ready .
-docker run --rm --network none repo-ready make test
+docker run --rm --network none repo-ready python -m pytest -q
 ```

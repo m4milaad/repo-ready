@@ -2,9 +2,9 @@
 
 ## Development
 
-1. Create a virtual environment with Python 3.11 or newer.
+1. Create a virtual environment with Python 3.12 or newer.
 2. Install the locked test dependency with `python -m pip install -r requirements.lock`.
-3. Run `make test` before opening a pull request.
+3. Run `python -m pytest -q` before opening a pull request.
 
 ## Changes
 
