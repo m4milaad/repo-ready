@@ -1,0 +1,16 @@
+{
+  "score": 10,
+  "ecosystems": ["python"],
+  "checks": {
+    "readme_sections": false,
+    "license": false,
+    "contributing": false,
+    "templates": false,
+    "lockfile": false,
+    "pinned_runtime": false,
+    "dockerfile": false,
+    "test_command": false,
+    "env_example": false,
+    "no_hardcoded_paths": true
+  }
+}
