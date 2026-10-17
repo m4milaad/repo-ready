@@ -252,8 +252,16 @@ def _node_manifest(ctx: RepoContext) -> bool:
 
 def _dependencies(ctx: RepoContext, ecosystem: str) -> bool:
     if ecosystem == "python":
-        requirements = next((entry.path for entry in ctx if re.fullmatch(r"requirements(?:-[^/]+)?\.txt", entry.path)), None)
-        if requirements and any(line.strip() and not line.lstrip().startswith(('#', '-')) for line in (ctx.read_text(requirements) or "").splitlines()):
+        requirements = sorted(
+            entry.path
+            for entry in ctx
+            if re.fullmatch(r"requirements(?:-[^/]+)?\.txt", entry.path)
+        )
+        if any(
+            line.strip() and not line.lstrip().startswith(("#", "-"))
+            for path in requirements
+            for line in (ctx.read_text(path) or "").splitlines()
+        ):
             return True
         value = _toml(ctx, "pyproject.toml")
         project = value.get("project") if value else None
@@ -287,18 +295,18 @@ def _lock_ok(ctx: RepoContext, ecosystem: str) -> bool | None:
             return True
         for name in ("uv.lock", "poetry.lock", "Pipfile.lock", "pdm.lock"):
             if _nonempty(ctx, (name,)):
-                if name == "Pipfile.lock" and _json(ctx, name) is None:
+                if name == "Pipfile.lock" and not _valid_pipfile_lock(ctx, name):
                     continue
                 return True
         return False
     package = _json(ctx, "package.json") or {}
     declared = {name for group in ("dependencies", "devDependencies", "optionalDependencies") if isinstance(package.get(group), dict) for name in package[group]}
-    path = _nonempty(ctx, ("package-lock.json", "yarn.lock", "pnpm-lock.yaml"))
+    path = _nonempty(ctx, ("package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml"))
     if path is None:
         return False
-    if path == "package-lock.json":
+    if path in {"package-lock.json", "npm-shrinkwrap.json"}:
         lock = _json(ctx, path)
-        if lock is None:
+        if not _valid_node_lock(lock):
             return False
         if not declared:
             return True
@@ -307,6 +315,33 @@ def _lock_ok(ctx: RepoContext, ecosystem: str) -> bool | None:
         dependencies = lock.get("dependencies")
         return declared.issubset(installed) or (isinstance(dependencies, dict) and declared.issubset(dependencies))
     return True
+
+
+def _valid_node_lock(lock: dict[str, object] | None) -> bool:
+    """Accept only the object-shaped npm lockfile forms we can inspect."""
+
+    if lock is None:
+        return False
+    version = lock.get("lockfileVersion")
+    if isinstance(version, bool) or not isinstance(version, int) or version not in {1, 2, 3}:
+        return False
+    packages = lock.get("packages")
+    dependencies = lock.get("dependencies")
+    if packages is not None and not isinstance(packages, dict):
+        return False
+    if dependencies is not None and not isinstance(dependencies, dict):
+        return False
+    return isinstance(packages, dict) or isinstance(dependencies, dict)
+
+
+def _valid_pipfile_lock(ctx: RepoContext, path: str) -> bool:
+    """Validate the required top-level structure of a Pipenv JSON lock."""
+
+    lock = _json(ctx, path)
+    if lock is None or not isinstance(lock.get("_meta"), dict):
+        return False
+    sections = [lock[name] for name in ("default", "develop") if name in lock]
+    return bool(sections) and all(isinstance(section, dict) for section in sections)
 
 
 def _ecosystem_score(rule_id: str, ecosystems: tuple[str, ...], evaluator: Callable[[str], bool | None], missing_message: str) -> CheckResult:
@@ -326,20 +361,23 @@ def rr06(ctx: RepoContext, ecosystems: tuple[str, ...]) -> CheckResult:
 
 def _runtime_ok(ctx: RepoContext, ecosystem: str) -> bool:
     if ecosystem == "python":
-        value = _text(ctx, (".python-version", "runtime.txt"))
-        if value and re.fullmatch(r"\s*\d+\.\d+(?:\.\d+)?\s*", value[1]):
-            return True
+        for name in (".python-version", "runtime.txt"):
+            value = ctx.read_text(name)
+            if value and re.fullmatch(r"\s*\d+\.\d+(?:\.\d+)?\s*", value):
+                return True
         tools = ctx.read_text(".tool-versions")
-        return bool(tools and re.search(r"(?m)^\s*python\s+\d+\.\d+(?:\.\d+)?\s*$", tools))
-    value = _text(ctx, (".nvmrc", ".node-version"))
-    if value and re.fullmatch(r"\s*v?\d+(?:\.\d+){0,2}\s*", value[1]):
-        return True
+        return bool(tools and re.search(r"(?m)^\s*python\s+\d+\.\d+(?:\.\d+)?\s*(?:#.*)?$", tools))
+    for name in (".nvmrc", ".node-version"):
+        value = ctx.read_text(name)
+        if value and re.fullmatch(r"\s*v?\d+(?:\.\d+){0,2}\s*", value):
+            return True
     package = _json(ctx, "package.json") or {}
     engines = package.get("engines")
-    if isinstance(engines, dict) and isinstance(engines.get("node"), str) and engines["node"].strip():
+    node_engine = engines.get("node") if isinstance(engines, dict) else None
+    if isinstance(node_engine, str) and re.fullmatch(r"\s*v?\d+(?:\.\d+){0,2}\s*", node_engine):
         return True
     tools = ctx.read_text(".tool-versions")
-    return bool(tools and re.search(r"(?m)^\s*nodejs\s+\S+", tools))
+    return bool(tools and re.search(r"(?m)^\s*nodejs\s+v?\d+(?:\.\d+){0,2}\s*(?:#.*)?$", tools))
 
 
 def rr07(ctx: RepoContext, ecosystems: tuple[str, ...]) -> CheckResult:
@@ -349,8 +387,16 @@ def rr07(ctx: RepoContext, ecosystems: tuple[str, ...]) -> CheckResult:
 def rr08(ctx: RepoContext) -> CheckResult:
     selected = _text(ctx, ("Dockerfile", "Containerfile"))
     if selected is None:
-        return _result("RR08", 0, [_finding("Dockerfile", "Root Dockerfile or Containerfile is missing.")])
+        entries = (ctx.entry("Dockerfile"), ctx.entry("Containerfile"))
+        detail = (
+            "Root Dockerfile or Containerfile is empty or unreadable."
+            if any(entry is not None for entry in entries)
+            else "Root Dockerfile or Containerfile is missing."
+        )
+        return _result("RR08", 0, [_finding("Dockerfile", detail)])
     path, text = selected
+    if not text.strip():
+        return _result("RR08", 0, [_finding(path, "Root Dockerfile or Containerfile is empty or unreadable.")])
     earned = 6
     findings: list[Finding] = []
     from_match = re.search(r"(?im)^\s*FROM\s+([^\s#]+)", text)

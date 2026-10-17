@@ -41,17 +41,10 @@ def checks(value: dict[str, object]) -> dict[str, dict[str, object]]:
     return {str(item["id"]): item for item in value["checks"] if isinstance(item, dict)}
 
 
-def compact(value: dict[str, object]) -> dict[str, object]:
-    return {
-        "score": value["score"],
-        "max": value["max"],
-        "grade": value["grade"],
-        "ecosystems": value["ecosystems"],
-        "checks": {
-            key: {"earned": value["earned"], "status": value["status"]}
-            for key, value in checks(value).items()
-        },
-    }
+def normalized_report(value: dict[str, object]) -> dict[str, object]:
+    normalized = dict(value)
+    normalized["path"] = "<REPO>"
+    return normalized
 
 
 def json_output(capsys: pytest.CaptureFixture[str]) -> dict[str, object]:
@@ -62,17 +55,39 @@ def json_output(capsys: pytest.CaptureFixture[str]) -> dict[str, object]:
 
 @pytest.mark.parametrize("case", CASES)
 def test_fixture_expected_json_contract(case: str, tmp_path: Path) -> None:
-    assert compact(report(copy_fixture(tmp_path, case))) == expected(case)
+    assert normalized_report(report(copy_fixture(tmp_path, case))) == expected(case)
 
 
-@pytest.mark.parametrize("case", ("perfect-python", "perfect-node", "polyglot-mixed"))
+@pytest.mark.parametrize("case", CASES)
 def test_report_schema_is_stable(case: str, tmp_path: Path) -> None:
     value = report(copy_fixture(tmp_path, case))
     assert tuple(value) == ("tool", "version", "path", "ecosystems", "score", "max", "grade", "checks")
     assert value["tool"] == "repo-ready"
     assert value["version"] == __version__
+    assert type(value["path"]) is str
+    assert type(value["ecosystems"]) is list
+    assert all(type(ecosystem) is str for ecosystem in value["ecosystems"])
+    assert type(value["score"]) is int
     assert value["max"] == 100
-    assert all(set(item) == {"id", "title", "weight", "earned", "status", "message", "fix_hint", "fixable", "findings"} for item in value["checks"])
+    assert type(value["max"]) is int
+    assert type(value["grade"]) is str
+    assert type(value["checks"]) is list
+    for item in value["checks"]:
+        assert tuple(item) == ("id", "title", "weight", "earned", "status", "message", "fix_hint", "fixable", "findings")
+        assert type(item["id"]) is str
+        assert type(item["title"]) is str
+        assert type(item["weight"]) is int
+        assert type(item["earned"]) is int
+        assert item["status"] in {"pass", "partial", "fail", "na"}
+        assert type(item["message"]) is str
+        assert item["fix_hint"] is None or type(item["fix_hint"]) is str
+        assert type(item["fixable"]) is bool
+        assert type(item["findings"]) is list
+        for finding in item["findings"]:
+            assert tuple(finding) == ("file", "line", "detail")
+            assert type(finding["file"]) is str
+            assert finding["line"] is None or type(finding["line"]) is int
+            assert type(finding["detail"]) is str
 
 
 @pytest.mark.parametrize(
@@ -102,10 +117,13 @@ def test_weights_sum_to_exactly_100() -> None:
 
 
 @pytest.mark.parametrize("case", CASES)
-def test_check_ids_are_sorted_and_titles_are_known(case: str, tmp_path: Path) -> None:
+def test_check_and_finding_order_is_stable(case: str, tmp_path: Path) -> None:
     value = report(copy_fixture(tmp_path, case))
     assert [item["id"] for item in value["checks"]] == list(RULE_IDS)
     assert [item["title"] for item in value["checks"]] == [CHECK_TITLES[key] for key in RULE_IDS]
+    for item in value["checks"]:
+        findings = item["findings"]
+        assert findings == sorted(findings, key=lambda finding: (finding["file"], finding["line"] or 0, finding["detail"]))
 
 
 @pytest.mark.parametrize("case", ("empty-repo", "python-bad", "node-bad"))
@@ -128,11 +146,11 @@ def test_repo_ready_scores_itself_100() -> None:
 
 
 def test_na_checks_earn_their_full_weight(tmp_path: Path) -> None:
-    value = report(copy_fixture(tmp_path, "empty-repo"))
-    for rule_id in ("RR10",):
-        item = checks(value)[rule_id]
-        assert item["status"] == "na"
-        assert item["earned"] == CHECK_WEIGHTS[rule_id]
+    for case in CASES:
+        value = report(copy_fixture(tmp_path, case))
+        for item in value["checks"]:
+            if item["status"] == "na":
+                assert item["earned"] == item["weight"] == CHECK_WEIGHTS[item["id"]]
 
 
 def test_mixed_ecosystem_scoring_is_proportional(tmp_path: Path) -> None:
@@ -200,6 +218,43 @@ def test_dockerfile_requires_non_latest_tag_and_command(tmp_path: Path) -> None:
     assert value["RR08"]["status"] == "partial"
 
 
+def test_empty_dockerfile_is_rejected(tmp_path: Path) -> None:
+    (tmp_path / "Dockerfile").write_text("\n", encoding="utf-8")
+    item = checks(report(tmp_path))["RR08"]
+    assert item["earned"] == 0
+    assert item["status"] == "fail"
+    assert item["findings"] == [{
+        "file": "Dockerfile",
+        "line": None,
+        "detail": "Root Dockerfile or Containerfile is empty or unreadable.",
+    }]
+
+
+@pytest.mark.parametrize(
+    ("manifest", "manifest_text", "lockfile"),
+    (
+        ("package.json", '{"name":"fixture","dependencies":{"fixture-lib":"1.0.0"}}\n', "package-lock.json"),
+        ("Pipfile", "[packages]\nfixture-lib = \"*\"\n", "Pipfile.lock"),
+    ),
+)
+def test_malformed_lockfiles_are_rejected(
+    manifest: str,
+    manifest_text: str,
+    lockfile: str,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / manifest).write_text(manifest_text, encoding="utf-8")
+    (tmp_path / lockfile).write_text("{not valid JSON\n", encoding="utf-8")
+    item = checks(report(tmp_path))["RR06"]
+    assert item["earned"] == 0
+    assert item["status"] == "fail"
+    assert item["findings"] == [{
+        "file": ".",
+        "line": None,
+        "detail": f"{'Node' if manifest == 'package.json' else 'Python'} project does not satisfy this check.",
+    }]
+
+
 def test_human_output_includes_findings_and_top_fixes(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["check", str(copy_fixture(tmp_path, "python-bad"))]) == 0
     output = capsys.readouterr().out
@@ -211,7 +266,8 @@ def test_human_output_includes_findings_and_top_fixes(tmp_path: Path, capsys: py
 def test_cli_json_matches_expected(case: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     repository = copy_fixture(tmp_path, case)
     assert main(["check", str(repository), "--json"]) == 0
-    assert compact(json_output(capsys)) == expected(case)
+    value = json_output(capsys)
+    assert normalized_report(value) == expected(case)
 
 
 def test_cli_json_is_deterministic(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
