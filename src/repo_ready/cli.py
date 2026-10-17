@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -11,6 +12,15 @@ from . import __version__
 from .context import RepoContext
 from .fixer import PlannedFile, apply_fix_plan, plan_fixes
 from .scoring import report
+
+
+_ANSI_RESET = "\033[0m"
+_STATUS_COLORS = {
+    "PASS": "\033[32m",
+    "PARTIAL": "\033[33m",
+    "FAIL": "\033[31m",
+    "NA": "\033[90m",
+}
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -42,6 +52,21 @@ def _resolve_repository(path: Path) -> Path | None:
     return resolved if resolved.is_dir() else None
 
 
+def _status_label(status: str, *, no_color: bool) -> str:
+    """Format a fixed-width status label for human-readable terminal output."""
+
+    padding = " " * max(0, 7 - len(status))
+    if no_color or "NO_COLOR" in os.environ:
+        return f"{status}{padding}"
+    isatty = getattr(sys.stdout, "isatty", None)
+    if not callable(isatty) or not isatty():
+        return f"{status}{padding}"
+    color = _STATUS_COLORS.get(status)
+    if color is None:
+        return f"{status}{padding}"
+    return f"{color}{status}{_ANSI_RESET}{padding}"
+
+
 def _print_human_report(result: dict[str, object], *, no_color: bool = False) -> None:
     print(f"Path: {result['path']}")
     ecosystems = result["ecosystems"]
@@ -54,7 +79,7 @@ def _print_human_report(result: dict[str, object], *, no_color: bool = False) ->
         if not isinstance(check, dict):
             continue
         status = str(check["status"]).upper()
-        print(f"{status:7} {check['id']} {check['title']}: {check['message']} ({check['earned']}/{check['weight']})")
+        print(f"{_status_label(status, no_color=no_color)} {check['id']} {check['title']}: {check['message']} ({check['earned']}/{check['weight']})")
         for finding in check.get("findings", []):
             if isinstance(finding, dict):
                 line = f":{finding['line']}" if finding.get("line") else ""

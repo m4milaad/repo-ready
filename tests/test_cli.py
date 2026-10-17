@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
 import socket
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -51,6 +53,28 @@ def json_output(capsys: pytest.CaptureFixture[str]) -> dict[str, object]:
     captured = capsys.readouterr()
     assert captured.err == ""
     return json.loads(captured.out)
+
+
+class _OutputStream(io.StringIO):
+    def __init__(self, *, tty: bool) -> None:
+        super().__init__()
+        self._tty = tty
+
+    def isatty(self) -> bool:
+        return self._tty
+
+
+def cli_output(
+    monkeypatch: pytest.MonkeyPatch,
+    repository: Path,
+    *,
+    tty: bool,
+    arguments: tuple[str, ...] = (),
+) -> str:
+    output = _OutputStream(tty=tty)
+    monkeypatch.setattr(sys, "stdout", output)
+    assert main(["check", str(repository), *arguments]) == 0
+    return output.getvalue()
 
 
 @pytest.mark.parametrize("case", CASES)
@@ -300,6 +324,47 @@ def test_config_min_score_returns_one(tmp_path: Path, capsys: pytest.CaptureFixt
 def test_cli_no_color_is_supported(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["check", str(copy_fixture(tmp_path, "perfect-python")), "--no-color"]) == 0
     assert "\x1b[" not in capsys.readouterr().out
+
+
+def test_cli_human_output_colors_tty_by_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    output = cli_output(monkeypatch, copy_fixture(tmp_path, "perfect-python"), tty=True)
+    assert "\x1b[32mPASS\x1b[0m" in output
+
+
+def test_cli_human_output_is_plain_for_non_tty(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    output = cli_output(monkeypatch, copy_fixture(tmp_path, "perfect-python"), tty=False)
+    assert "\x1b" not in output
+    assert "PASS" in output
+
+
+def test_cli_no_color_environment_disables_tty_colors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("NO_COLOR", "1")
+    output = cli_output(monkeypatch, copy_fixture(tmp_path, "perfect-python"), tty=True)
+    assert "\x1b" not in output
+
+
+def test_cli_no_color_flag_disables_tty_colors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    output = cli_output(
+        monkeypatch,
+        copy_fixture(tmp_path, "perfect-python"),
+        tty=True,
+        arguments=("--no-color",),
+    )
+    assert "\x1b" not in output
+
+
+def test_cli_json_output_is_ansi_free_on_tty(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repository = copy_fixture(tmp_path, "perfect-python")
+    output = _OutputStream(tty=True)
+    monkeypatch.setattr(sys, "stdout", output)
+
+    assert main(["check", str(repository), "--json"]) == 0
+    assert "\x1b" not in output.getvalue()
+    json.loads(output.getvalue())
 
 
 def test_cli_invalid_path_returns_two(capsys: pytest.CaptureFixture[str]) -> None:
