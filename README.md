@@ -6,6 +6,16 @@ supports Python and Node projects, reports a deterministic score from 0 to
 100, explains failed checks, and safely scaffolds missing documentation and
 configuration files without overwriting anything.
 
+## Live demo
+
+This project is a local CLI, so it has no hosted web demo. The reproducible
+Docker test run below is the judge-facing demo:
+
+```sh
+docker build -t repo-ready .
+docker run --rm --network none repo-ready python -m pytest -q
+```
+
 ## Requirements
 
 - Python 3.12
