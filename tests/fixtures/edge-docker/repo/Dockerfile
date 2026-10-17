@@ -1,4 +1,3 @@
-FROM python:3.12.4-slim AS runtime
+FROM python:latest AS runtime
 WORKDIR /app
 COPY . .
-CMD ["python", "-m", "http.server", "8080"]

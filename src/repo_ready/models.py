@@ -1,4 +1,4 @@
-"""Stable public report models used by the CLI and library callers."""
+"""Stable data models for readiness reports."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from typing import Any
 
 @dataclass(frozen=True)
 class Finding:
-    """A deterministic explanation for a check result."""
+    """One deterministic, relative-path explanation for a check result."""
 
     file: str
     line: int | None
@@ -22,29 +22,43 @@ class Finding:
 
 @dataclass(frozen=True)
 class CheckResult:
-    """One readiness rule and its weighted outcome."""
+    """The public result for one RR01--RR13 check."""
 
     id: str
-    message: str
+    title: str
     weight: int
+    earned: int
     status: str
-    score: int
-    max_score: int
+    message: str
+    fix_hint: str | None
+    fixable: bool
     findings: tuple[Finding, ...] = field(default_factory=tuple)
 
     @property
+    def score(self) -> int:
+        """Compatibility alias for callers of the initial MVP API."""
+
+        return self.earned
+
+    @property
+    def max_score(self) -> int:
+        return self.weight
+
+    @property
     def max(self) -> int:
-        return self.max_score
+        return self.weight
 
     def as_dict(self) -> dict[str, object]:
-        findings = sorted(self.findings, key=lambda item: (item.file, item.line or 0))
+        findings = sorted(self.findings, key=lambda item: (item.file, item.line or 0, item.detail))
         return {
             "id": self.id,
-            "message": self.message,
+            "title": self.title,
             "weight": self.weight,
+            "earned": self.earned,
             "status": self.status,
-            "score": self.score,
-            "max": self.max_score,
+            "message": self.message,
+            "fix_hint": self.fix_hint,
+            "fixable": self.fixable,
             "findings": [finding.as_dict() for finding in findings],
         }
 
@@ -53,7 +67,7 @@ class CheckResult:
 
 @dataclass(frozen=True)
 class ScanReport:
-    """The complete machine-readable scan result."""
+    """The complete machine-readable report."""
 
     tool: str
     version: str
@@ -69,16 +83,15 @@ class ScanReport:
         return self.max_score
 
     def as_dict(self) -> dict[str, object]:
-        checks = sorted(self.checks, key=lambda check: check.id)
         return {
             "tool": self.tool,
             "version": self.version,
             "path": self.path,
-            "ecosystems": list(self.ecosystems),
+            "ecosystems": sorted(self.ecosystems),
             "score": self.score,
             "max": self.max_score,
             "grade": self.grade,
-            "checks": [check.as_dict() for check in checks],
+            "checks": [check.as_dict() for check in sorted(self.checks, key=lambda item: item.id)],
         }
 
     to_dict = as_dict

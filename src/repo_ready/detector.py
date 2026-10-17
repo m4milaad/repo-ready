@@ -6,6 +6,7 @@ project metadata, execute package managers, or inspect the network.
 
 from __future__ import annotations
 
+import fnmatch
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -31,7 +32,12 @@ class MarkerFileDetector:
 
     def detect(self, root: Path | RepoContext) -> bool:
         context = root if isinstance(root, RepoContext) else RepoContext(root)
-        return any(context.has_file(marker) for marker in self.marker_files)
+        return any(
+            any(entry.path == marker or fnmatch.fnmatchcase(entry.path, marker) for entry in context)
+            if "*" in marker
+            else context.has_file(marker)
+            for marker in self.marker_files
+        )
 
     def detects(self, root: Path | RepoContext) -> bool:
         """Backward-compatible spelling for the detector operation."""
@@ -45,24 +51,16 @@ ECOSYSTEM_DETECTORS: tuple[EcosystemDetector, ...] = (
         "python",
         (
             "pyproject.toml",
-            "requirements.txt",
-            "requirements.lock",
+            "requirements*.txt",
             "setup.py",
             "setup.cfg",
             "Pipfile",
-            "uv.lock",
-            "poetry.lock",
         ),
     ),
     MarkerFileDetector(
         "node",
         (
             "package.json",
-            "package-lock.json",
-            "npm-shrinkwrap.json",
-            "yarn.lock",
-            "pnpm-lock.yaml",
-            ".nvmrc",
         ),
     ),
 )

@@ -1,4 +1,4 @@
-"""Non-destructive scaffolding for missing repository readiness files."""
+"""Non-destructive, filesystem-only fix planning and application."""
 
 from __future__ import annotations
 
@@ -6,252 +6,269 @@ import json
 import re
 import tomllib
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
+from .checks import environment_reads
+from .context import RepoContext
 from .detector import detect_ecosystems
 
 
 @dataclass(frozen=True)
 class PlannedFile:
-    """A file that can be created without changing an existing file."""
-
     path: Path
     content: str
+    reason: str = ""
 
 
-_README = """# Repository\n\n## Requirements\n\nDocument the runtime and system requirements here.\n\n## Setup\n\nDescribe how to install dependencies.\n\n## Run\n\nDescribe how to run the project.\n\n## Test\n\nDescribe how to run the test suite.\n\n## Deploy / rebuild\n\nDescribe how to build and run the project from a clean environment.\n\n## Configuration\n\nCopy `.env.example` for local configuration.\n"""
+_README = """# Repository
 
-_LICENSE = """MIT License\n\nCopyright (c) 2026 Project Authors\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE.\n"""
+## Setup
 
-_CONTRIBUTING = """# Contributing\n\n1. Make a focused change.\n2. Run the documented test command.\n3. Describe the change and its verification in the pull request.\n"""
+Describe the runtime and installation steps.
 
-_PULL_REQUEST_TEMPLATE = """## Summary\n\nDescribe the change and why it is needed.\n\n## Verification\n\n- [ ] Tests pass\n- [ ] Documentation is updated when needed\n"""
+## Run
 
-_ISSUE_TEMPLATE = """---\nname: Bug report\nabout: Report a reproducible problem\ntitle: \"\"\nlabels: bug\n---\n\n## What happened?\n\n## Steps to reproduce\n\n## Expected behavior\n\n## Environment\n"""
+Describe how to run the project.
 
-_ENV_EXAMPLE = "# Add non-secret local configuration values here.\n"
+## Test
+
+Describe the project's test command.
+
+## Deploy / rebuild
+
+Describe how to rebuild this repository from a clean checkout.
+"""
+_CONTRIBUTING = """# Contributing
+
+Thanks for contributing. Explain the development setup, the supported runtime,
+the test command, how to report issues, and what a pull request should contain.
+Keep changes focused, run the documented tests before submitting, and include
+the exact verification command in the pull request description.
+"""
+_ISSUE = """---
+name: Bug report
+about: Report a reproducible problem
+---
+
+## What happened?
+
+## Steps to reproduce
+
+## Expected behavior
+"""
+_PR = """## Summary
+
+## Verification
+
+- [ ] `python -m pytest -q` or the documented project test command
+"""
+_MIT = """MIT License
+
+Copyright (c) {holder}
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the \"Software\"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+"""
+_CI = """name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pytest -q
+"""
+_DOCKERIGNORE = ".git\n.venv\n__pycache__\n.pytest_cache\n.env\n"
 
 
-def _exists(root: Path, relative: str) -> bool:
-    return (root / relative).exists()
-
-
-def _first_existing(root: Path, names: tuple[str, ...]) -> bool:
-    return any(_exists(root, name) for name in names)
-
-
-def _python_version(root: Path) -> str:
-    path = root / "pyproject.toml"
+def _trusted_root(root: str | Path) -> Path | None:
     try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
-        return "3.11"
-    match = re.search(r"(?im)^\s*requires-python\s*=\s*[\"']\s*(?:>=)?(\d+\.\d+)", text)
-    return match.group(1) if match else "3.11"
+        candidate = Path(root).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError):
+        return None
+    return candidate if candidate.is_dir() else None
 
 
-def _node_version(root: Path) -> str:
+def _safe_target(root: Path, relative: str) -> Path | None:
+    pure = PurePosixPath(relative)
+    if pure.is_absolute() or ".." in pure.parts or not pure.parts:
+        return None
+    target = root.joinpath(*pure.parts)
+    current = root
+    for part in pure.parts[:-1]:
+        current = current / part
+        if current.is_symlink():
+            return None
+    if target.exists() or target.is_symlink():
+        return None
     try:
-        package = json.loads((root / "package.json").read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return "20"
-    if isinstance(package, dict):
-        engines = package.get("engines")
-        if isinstance(engines, dict):
-            version = engines.get("node")
-            if isinstance(version, str):
-                match = re.search(r"(\d+(?:\.\d+){0,2})", version)
-                if match:
-                    return match.group(1)
-    return "20"
+        if not target.parent.resolve(strict=False).is_relative_to(root):
+            return None
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return target
 
 
-def _package_lock(root: Path) -> str:
+def _plan(root: Path, relative: str, content: str, reason: str) -> PlannedFile | None:
+    target = _safe_target(root, relative)
+    return PlannedFile(target, content, reason) if target is not None else None
+
+
+def _toml(root: Path, relative: str) -> dict[str, object] | None:
     try:
-        package = json.loads((root / "package.json").read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        package = {}
-    if not isinstance(package, dict):
-        package = {}
-    root_package: dict[str, object] = {}
-    for key in ("name", "version", "engines"):
-        if key in package:
-            root_package[key] = package[key]
-    document = {
-        "name": package.get("name", "repository"),
-        "version": package.get("version", "0.0.0"),
-        "lockfileVersion": 3,
-        "requires": True,
-        "packages": {"": root_package},
-    }
-    return json.dumps(document, indent=2) + "\n"
-
-
-def _python_dependencies_exist(root: Path) -> bool:
-    requirements = root / "requirements.txt"
-    try:
-        if any(
-            line.strip() and not line.lstrip().startswith("#")
-            for line in requirements.read_text(encoding="utf-8").splitlines()
-        ):
-            return True
-    except (OSError, UnicodeError):
-        pass
-
-    try:
-        project = tomllib.loads(
-            (root / "pyproject.toml").read_text(encoding="utf-8")
-        ).get("project", {})
+        return tomllib.loads((root / relative).read_text(encoding="utf-8"))
     except (OSError, UnicodeError, tomllib.TOMLDecodeError):
-        return False
-    if not isinstance(project, dict):
-        return False
-    return bool(project.get("dependencies")) or bool(
-        project.get("optional-dependencies")
-    )
+        return None
 
 
-def _node_dependencies_exist(root: Path) -> bool:
+def _python_runtime(root: Path, explicit: str | None) -> str | None:
+    if explicit:
+        return explicit.lstrip("v")
+    document = _toml(root, "pyproject.toml")
+    project = document.get("project") if isinstance(document, dict) else None
+    requires = project.get("requires-python") if isinstance(project, dict) else None
+    if isinstance(requires, str):
+        match = re.search(r"(?<!\d)(\d+\.\d+(?:\.\d+)?)", requires)
+        if match:
+            return match.group(1)
+    tools = (root / ".tool-versions").read_text(encoding="utf-8") if (root / ".tool-versions").is_file() else ""
+    match = re.search(r"(?m)^\s*python\s+(\d+\.\d+(?:\.\d+)?)", tools)
+    return match.group(1) if match else None
+
+
+def _node_runtime(root: Path, explicit: str | None) -> str | None:
+    if explicit:
+        return explicit.lstrip("v")
     try:
         package = json.loads((root / "package.json").read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
-        return False
-    if not isinstance(package, dict):
-        return False
-    return any(
-        isinstance(package.get(group), dict) and package[group]
-        for group in ("dependencies", "devDependencies", "optionalDependencies")
-    )
+        return None
+    engines = package.get("engines") if isinstance(package, dict) else None
+    value = engines.get("node") if isinstance(engines, dict) else None
+    match = re.search(r"(?<!\d)(\d+(?:\.\d+){0,2})", value) if isinstance(value, str) else None
+    return match.group(1) if match else None
 
 
-def _dockerfile(ecosystems: list[str], root: Path) -> str:
+def _dockerfile(ecosystems: list[str], runtime: str) -> str:
     if "python" in ecosystems:
-        version = _python_version(root)
-        return (
-            f"FROM python:{version}-slim\n\n"
-            "WORKDIR /app\n"
-            "COPY . .\n"
-            "\n"
-            'CMD ["python", "-m", "unittest", "discover"]\n'
-        )
-    if "node" in ecosystems:
-        version = _node_version(root)
-        return (
-            f"FROM node:{version}-slim\n\n"
-            "WORKDIR /app\n"
-            "COPY . .\n\n"
-            'CMD ["node", "--test"]\n'
-        )
-    return "FROM debian:bookworm-slim\n\nWORKDIR /app\nCOPY . .\n"
+        return f"FROM python:{runtime}-slim\n\nWORKDIR /app\nCOPY . .\nCMD [\"python\", \"-m\", \"pytest\", \"-q\"]\n"
+    return f"FROM node:{runtime}-slim\n\nWORKDIR /app\nCOPY package*.json ./\nCOPY . .\nCMD [\"npm\", \"test\"]\n"
 
 
-def _makefile(ecosystems: list[str]) -> str:
-    if "python" in ecosystems:
-        command = "python -m unittest discover"
-    elif "node" in ecosystems:
-        command = "npm test"
-    else:
-        command = "@echo \"Add the project test command\""
-    return f".PHONY: test\n\ntest:\n\t{command}\n"
+def plan_fixes(
+    root: str | Path,
+    *,
+    license_name: str | None = None,
+    holder: str | None = None,
+    runtime_version: str | None = None,
+) -> list[PlannedFile]:
+    """Plan only safe creations inside *root*; never plan lockfiles or tests."""
 
-
-def plan_fixes(root: Path) -> list[PlannedFile]:
-    """Return creations needed for currently missing, fixable checks."""
-
-    ecosystems = detect_ecosystems(root)
+    trusted = _trusted_root(root)
+    if trusted is None:
+        return []
+    context = RepoContext(trusted)
+    ecosystems = detect_ecosystems(context)
     plans: list[PlannedFile] = []
 
-    if not _first_existing(root, ("README.md", "README.rst", "README.txt")):
-        plans.append(PlannedFile(root / "README.md", _README))
-    if not _first_existing(
-        root, ("LICENSE", "LICENSE.md", "LICENSE.txt", "COPYING", "COPYING.md")
-    ):
-        plans.append(PlannedFile(root / "LICENSE", _LICENSE))
-    if not _first_existing(
-        root, ("CONTRIBUTING.md", "CONTRIBUTING.rst", "CONTRIBUTING.txt")
-    ):
-        plans.append(PlannedFile(root / "CONTRIBUTING.md", _CONTRIBUTING))
+    def add(relative: str, content: str, reason: str) -> None:
+        planned = _plan(trusted, relative, content, reason)
+        if planned:
+            plans.append(planned)
 
-    if not _first_existing(
-        root,
-        (
-            ".github/PULL_REQUEST_TEMPLATE.md",
-            ".github/PULL_REQUEST_TEMPLATE.txt",
-            ".github/pull_request_template.md",
-        ),
-    ):
-        plans.append(
-            PlannedFile(root / ".github" / "PULL_REQUEST_TEMPLATE.md", _PULL_REQUEST_TEMPLATE)
-        )
-    issue_directory = root / ".github" / "ISSUE_TEMPLATE"
-    issue_files: list[Path] = []
-    if issue_directory.is_dir():
-        try:
-            issue_files = [
-                path
-                for path in issue_directory.iterdir()
-                if path.is_file() and path.stat().st_size > 0
-            ]
-        except OSError:
-            issue_files = []
-    if not issue_files:
-        plans.append(PlannedFile(issue_directory / "bug_report.md", _ISSUE_TEMPLATE))
+    if _nonempty(context, ("README.md", "README.rst", "README.txt")) is None:
+        add("README.md", _README, "README skeleton")
+    if _nonempty(context, ("CONTRIBUTING.md", "docs/CONTRIBUTING.md", ".github/CONTRIBUTING.md")) is None:
+        add("CONTRIBUTING.md", _CONTRIBUTING, "contributor guide")
+    if _nonempty(context, ("ISSUE_TEMPLATE.md",)) is None and not any(entry.path.startswith(".github/ISSUE_TEMPLATE/") and entry.size > 0 for entry in context):
+        add(".github/ISSUE_TEMPLATE/bug_report.md", _ISSUE, "issue template")
+    if _nonempty(context, (".github/PULL_REQUEST_TEMPLATE.md", "PULL_REQUEST_TEMPLATE.md", "docs/PULL_REQUEST_TEMPLATE.md")) is None:
+        add(".github/PULL_REQUEST_TEMPLATE.md", _PR, "pull-request template")
+    if license_name == "mit" and holder and _nonempty(context, ("LICENSE", "LICENSE.md", "LICENSE.txt", "COPYING")) is None:
+        add("LICENSE", _MIT.format(holder=holder), "MIT license requested explicitly")
 
-    if (
-        "python" in ecosystems
-        and not _first_existing(root, ("uv.lock", "poetry.lock", "requirements.lock"))
-        and not _python_dependencies_exist(root)
-    ):
-        plans.append(
-            PlannedFile(
-                root / "requirements.lock",
-                "# Add the resolved Python dependency set here.\n",
-            )
-        )
-    if (
-        "node" in ecosystems
-        and not _first_existing(
-            root,
-            ("package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml"),
-        )
-        and not _node_dependencies_exist(root)
-    ):
-        plans.append(PlannedFile(root / "package-lock.json", _package_lock(root)))
-
-    if "python" in ecosystems and not _exists(root, ".python-version"):
-        plans.append(PlannedFile(root / ".python-version", _python_version(root) + "\n"))
-    if "node" in ecosystems and not _exists(root, ".nvmrc"):
-        plans.append(PlannedFile(root / ".nvmrc", _node_version(root) + "\n"))
-
-    if not _first_existing(root, ("Dockerfile", "dockerfile")):
-        plans.append(PlannedFile(root / "Dockerfile", _dockerfile(ecosystems, root)))
-
-    if not _first_existing(root, ("Makefile", "makefile", "GNUmakefile")):
-        plans.append(PlannedFile(root / "Makefile", _makefile(ecosystems)))
-
-    if not _exists(root, ".env.example"):
-        plans.append(PlannedFile(root / ".env.example", _ENV_EXAMPLE))
-
+    if "python" in ecosystems and _nonempty(context, (".python-version", "runtime.txt")) is None:
+        runtime = _python_runtime(trusted, runtime_version)
+        if runtime:
+            add(".python-version", runtime + "\n", "Python runtime pin")
+    if "node" in ecosystems and _nonempty(context, (".nvmrc", ".node-version")) is None:
+        runtime = _node_runtime(trusted, runtime_version)
+        if runtime:
+            add(".nvmrc", runtime + "\n", "Node runtime pin")
+    if _nonempty(context, ("Dockerfile", "Containerfile")) is None and ecosystems:
+        runtime = _python_runtime(trusted, runtime_version) if "python" in ecosystems else _node_runtime(trusted, runtime_version)
+        if runtime:
+            add("Dockerfile", _dockerfile(ecosystems, runtime), "Dockerfile from detected runtime")
+            add(".dockerignore", _DOCKERIGNORE, "Docker build context exclusions")
+    reads = environment_reads(context)
+    if reads and _nonempty(context, (".env.example", ".env.sample", ".env.template")) is None:
+        keys = sorted({name for _, _, name in reads})
+        add(".env.example", "".join(f"{key}=\n" for key in keys), "environment variable documentation")
+    if _nonempty(context, (".gitignore",)) is None:
+        lines = [".env", "__pycache__", ".venv"]
+        if "node" in ecosystems:
+            lines.append("node_modules")
+        add(".gitignore", "\n".join(lines) + "\n", "ecosystem gitignore")
+    if not any(entry.path.startswith(".github/workflows/") and entry.size > 0 for entry in context):
+        add(".github/workflows/ci.yml", _CI, "CI workflow")
     return plans
 
 
-def apply_fixes(plans: list[PlannedFile], dry_run: bool = False) -> list[Path]:
-    """Apply planned creations, returning paths actually created or planned.
+def _nonempty(context: RepoContext, names: tuple[str, ...]) -> str | None:
+    for name in names:
+        entry = context.entry(name)
+        if entry and entry.readable and entry.size > 0:
+            return name
+    return None
 
-    Exclusive creation keeps the no-overwrite guarantee even if a file appears
-    between planning and writing.
-    """
 
+def apply_fixes(plans: list[PlannedFile], *, root: str | Path, dry_run: bool = False) -> list[Path]:
+    """Create planned files with exclusive mode and a second containment check."""
+
+    trusted = _trusted_root(root)
+    if trusted is None:
+        return []
     completed: list[Path] = []
     for plan in plans:
-        if dry_run:
-            completed.append(plan.path)
-            continue
         try:
-            plan.path.parent.mkdir(parents=True, exist_ok=True)
-            with plan.path.open("x", encoding="utf-8", newline="") as handle:
+            target = plan.path.resolve(strict=False)
+            if not target.is_relative_to(trusted):
+                continue
+            current = trusted
+            relative = target.relative_to(trusted)
+            for part in relative.parts[:-1]:
+                current = current / part
+                if current.is_symlink():
+                    raise OSError("symlinked parent")
+            if dry_run:
+                completed.append(target)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("x", encoding="utf-8", newline="") as handle:
                 handle.write(plan.content)
-        except FileExistsError:
+            completed.append(target)
+        except (FileExistsError, OSError, RuntimeError):
             continue
-        completed.append(plan.path)
     return completed

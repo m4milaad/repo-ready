@@ -109,6 +109,7 @@ class RepoContext:
             candidate = Path(os.path.abspath(os.fspath(candidate)))
         self.root = candidate
         self.max_file_bytes = max(0, int(max_file_bytes))
+        self.min_score = self._read_min_score()
         self.config_excludes = self._read_config_excludes()
         self.excludes = tuple(
             dict.fromkeys((*DEFAULT_EXCLUDES, *self.config_excludes, *excludes))
@@ -133,6 +134,17 @@ class RepoContext:
         if not isinstance(values, list):
             return ()
         return tuple(value for value in values if isinstance(value, str) and value.strip())
+
+    def _read_min_score(self) -> int | None:
+        config = self.root / ".repo-ready.toml"
+        if not _safe_regular_file(config):
+            return None
+        try:
+            document = tomllib.loads(config.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+            return None
+        value = document.get("min_score") if isinstance(document, dict) else None
+        return value if isinstance(value, int) and 0 <= value <= 100 else None
 
     def is_excluded(self, relative: str | Path) -> bool:
         path = _posix_path(relative)
@@ -172,7 +184,8 @@ class RepoContext:
             binary = False
             if not too_large:
                 try:
-                    binary = b"\x00" in Path(item.path).read_bytes()
+                    with Path(item.path).open("rb") as source:
+                        binary = b"\x00" in source.read(8192)
                 except OSError:
                     continue
             found.append(FileEntry(relative, Path(item.path), size, too_large, binary))
@@ -238,7 +251,7 @@ class RepoContext:
                     os.close(descriptor)
                 except OSError:
                     pass
-        if len(data) > self.max_file_bytes or b"\x00" in data:
+        if len(data) > self.max_file_bytes or b"\x00" in data[:8192]:
             return None
         return data
 

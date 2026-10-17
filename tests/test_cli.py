@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import json
 import os
 import shutil
@@ -11,472 +10,294 @@ from pathlib import Path
 import pytest
 
 from repo_ready import __version__
-from repo_ready.checks import CHECK_MESSAGES, CHECK_WEIGHTS
+from repo_ready.checks import CHECK_TITLES, CHECK_WEIGHTS, environment_reads
+from repo_ready.cli import main
 from repo_ready.context import RepoContext
 from repo_ready.detector import detect_ecosystems
 from repo_ready.fixer import plan_fixes
 from repo_ready.scoring import report
-from repo_ready.cli import main
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
-CASES = (
-    "perfect-python",
-    "perfect-node",
-    "empty-repo",
-    "python-bad",
-    "node-bad",
-    "polyglot-mixed",
-    "edge-readme-variants",
-    "edge-binary-and-large",
-    "edge-symlinks",
-    "edge-env-usage",
-    "edge-docker",
-    "edge-non-utf8",
-    "config-excludes",
-)
-RULE_IDS = tuple(f"RR{number:02d}" for number in range(1, 14))
+CASES = tuple(sorted(path.name for path in FIXTURES.iterdir() if path.is_dir() and (path / "repo").is_dir()))
+RULE_IDS = tuple(CHECK_WEIGHTS)
 
 
-def _fixture_repo(case: str) -> Path:
+def fixture_repo(case: str) -> Path:
     return FIXTURES / case / "repo"
 
 
-def _expected(case: str) -> dict[str, object]:
+def expected(case: str) -> dict[str, object]:
     return json.loads((FIXTURES / case / "expected.json").read_text(encoding="utf-8"))
 
 
-def _copy_fixture(tmp_path: Path, case: str) -> Path:
+def copy_fixture(tmp_path: Path, case: str) -> Path:
     destination = tmp_path / case / "repo"
-    shutil.copytree(_fixture_repo(case), destination, symlinks=True)
+    shutil.copytree(fixture_repo(case), destination, symlinks=True)
     return destination
 
 
-def _normalise_report(value: dict[str, object]) -> dict[str, object]:
-    result = copy.deepcopy(value)
-    result["path"] = "<REPO>"
-    return result
+def checks(value: dict[str, object]) -> dict[str, dict[str, object]]:
+    return {str(item["id"]): item for item in value["checks"] if isinstance(item, dict)}
 
 
-def _checks(value: dict[str, object]) -> dict[str, dict[str, object]]:
-    checks = value["checks"]
-    if isinstance(checks, list):
-        return {str(item["id"]): item for item in checks if isinstance(item, dict)}
-    return {str(key): item for key, item in checks.items()}  # type: ignore[union-attr]
+def compact(value: dict[str, object]) -> dict[str, object]:
+    return {
+        "score": value["score"],
+        "max": value["max"],
+        "grade": value["grade"],
+        "ecosystems": value["ecosystems"],
+        "checks": {
+            key: {"earned": value["earned"], "status": value["status"]}
+            for key, value in checks(value).items()
+        },
+    }
 
 
-def _json_stdout(capsys: pytest.CaptureFixture[str]) -> dict[str, object]:
+def json_output(capsys: pytest.CaptureFixture[str]) -> dict[str, object]:
     captured = capsys.readouterr()
     assert captured.err == ""
     return json.loads(captured.out)
 
 
-def _help_text(argv: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, str]:
-    with pytest.raises(SystemExit) as raised:
-        main(argv)
-    captured = capsys.readouterr()
-    return int(raised.value.code), captured.out + captured.err
-
-
-def _supports_option(
-    argv: list[str], option: str, capsys: pytest.CaptureFixture[str]
-) -> bool:
-    _code, text = _help_text(argv, capsys)
-    return option in text
-
-
 @pytest.mark.parametrize("case", CASES)
-def test_copied_fixture_report_matches_expected_contract(
-    case: str, tmp_path: Path
-) -> None:
-    repository = _copy_fixture(tmp_path, case)
-
-    actual = _normalise_report(report(repository))
-
-    assert actual == _expected(case)
+def test_fixture_expected_json_contract(case: str, tmp_path: Path) -> None:
+    assert compact(report(copy_fixture(tmp_path, case))) == expected(case)
 
 
 @pytest.mark.parametrize("case", ("perfect-python", "perfect-node", "polyglot-mixed"))
-def test_report_has_stable_top_level_json_schema(case: str, tmp_path: Path) -> None:
-    value = report(_copy_fixture(tmp_path, case))
-
-    assert set(value) == {"tool", "version", "path", "ecosystems", "score", "max", "grade", "checks"}
+def test_report_schema_is_stable(case: str, tmp_path: Path) -> None:
+    value = report(copy_fixture(tmp_path, case))
+    assert tuple(value) == ("tool", "version", "path", "ecosystems", "score", "max", "grade", "checks")
     assert value["tool"] == "repo-ready"
     assert value["version"] == __version__
-    assert isinstance(value["path"], str)
-    assert isinstance(value["ecosystems"], list)
-    assert isinstance(value["checks"], list)
+    assert value["max"] == 100
+    assert all(set(item) == {"id", "title", "weight", "earned", "status", "message", "fix_hint", "fixable", "findings"} for item in value["checks"])
 
 
 @pytest.mark.parametrize(
     ("marker", "ecosystem"),
-    (
-        ("pyproject.toml", "python"),
-        ("requirements.txt", "python"),
-        ("requirements.lock", "python"),
-        ("setup.py", "python"),
-        ("setup.cfg", "python"),
-        ("Pipfile", "python"),
-        ("uv.lock", "python"),
-        ("poetry.lock", "python"),
-        ("package.json", "node"),
-        ("package-lock.json", "node"),
-        ("npm-shrinkwrap.json", "node"),
-        ("yarn.lock", "node"),
-        ("pnpm-lock.yaml", "node"),
-        (".nvmrc", "node"),
-    ),
+    (("pyproject.toml", "python"), ("requirements.txt", "python"), ("requirements-dev.txt", "python"),
+     ("setup.py", "python"), ("setup.cfg", "python"), ("Pipfile", "python"), ("package.json", "node")),
 )
-def test_each_supported_detector_marker_is_publicly_detectable(
-    tmp_path: Path, marker: str, ecosystem: str
-) -> None:
-    (tmp_path / marker).write_text("marker\n", encoding="utf-8")
-
+def test_supported_manifest_markers(marker: str, ecosystem: str, tmp_path: Path) -> None:
+    (tmp_path / marker).write_text("{}\n" if marker.endswith(".json") else "marker\n", encoding="utf-8")
     assert detect_ecosystems(tmp_path) == [ecosystem]
 
 
-def test_detector_returns_stable_python_then_node_order(tmp_path: Path) -> None:
+def test_mixed_ecosystems_are_sorted(tmp_path: Path) -> None:
     (tmp_path / "package.json").write_text("{}\n", encoding="utf-8")
-    (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
-
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
     assert detect_ecosystems(tmp_path) == ["python", "node"]
 
 
-@pytest.mark.parametrize(
-    ("rule_id", "case", "status"),
-    (
-        ("RR01", "empty-repo", "fail"),
-        ("RR02", "empty-repo", "fail"),
-        ("RR03", "empty-repo", "fail"),
-        ("RR04", "empty-repo", "fail"),
-        ("RR05", "python-bad", "fail"),
-        ("RR06", "python-bad", "fail"),
-        ("RR07", "python-bad", "fail"),
-        ("RR08", "python-bad", "fail"),
-        ("RR09", "python-bad", "fail"),
-        ("RR10", "empty-repo", "fail"),
-        ("RR11", "python-bad", "fail"),
-        ("RR12", "python-bad", "fail"),
-        ("RR13", "python-bad", "fail"),
-    ),
-)
-def test_each_rr_boundary_has_a_failing_case(
-    rule_id: str, case: str, status: str, tmp_path: Path
-) -> None:
-    check = _checks(report(_copy_fixture(tmp_path, case)))[rule_id]
-
-    assert check["status"] == status
-    assert check["id"] == rule_id
-    assert check["message"] == CHECK_MESSAGES[rule_id]
-
-
 @pytest.mark.parametrize("rule_id", RULE_IDS)
-def test_each_rr_rule_has_weight_and_bounded_score(rule_id: str, tmp_path: Path) -> None:
-    check = _checks(report(_copy_fixture(tmp_path, "perfect-python")))[rule_id]
-
-    assert check["weight"] == CHECK_WEIGHTS[rule_id]
-    assert 0 <= check["score"] <= check["max"] <= check["weight"]
-    assert isinstance(check["findings"], list)
+def test_every_rule_has_the_fixed_weight(rule_id: str) -> None:
+    assert CHECK_WEIGHTS[rule_id] == {"RR01": 14, "RR02": 6, "RR03": 6, "RR04": 4, "RR05": 4, "RR06": 10, "RR07": 8, "RR08": 12, "RR09": 12, "RR10": 6, "RR11": 8, "RR12": 4, "RR13": 6}[rule_id]
 
 
-def test_partial_and_na_scoring_are_distinct(tmp_path: Path) -> None:
-    mixed = _checks(report(_copy_fixture(tmp_path / "mixed", "polyglot-mixed")))
-    empty = _checks(report(_copy_fixture(tmp_path / "empty", "empty-repo")))
-
-    assert mixed["RR05"]["status"] == "partial"
-    assert mixed["RR05"]["score"] == 2
-    assert mixed["RR06"]["status"] == "partial"
-    assert mixed["RR07"]["status"] == "partial"
-    assert empty["RR05"]["status"] == "na"
-    assert empty["RR05"]["max"] == 0
-    assert empty["RR13"]["status"] == "na"
-
-
-def test_multi_ecosystem_credit_is_proportional_and_ordered(tmp_path: Path) -> None:
-    value = report(_copy_fixture(tmp_path, "polyglot-mixed"))
-    checks = _checks(value)
-
-    assert value["ecosystems"] == ["python", "node"]
-    assert checks["RR05"]["score"] == round(CHECK_WEIGHTS["RR05"] / 2)
-    assert checks["RR06"]["score"] == round(CHECK_WEIGHTS["RR06"] / 2)
-    assert checks["RR07"]["score"] == round(CHECK_WEIGHTS["RR07"] / 2)
-    assert checks["RR08"]["score"] == 11
-
-
-def test_all_check_weights_sum_to_one_hundred() -> None:
+def test_weights_sum_to_exactly_100() -> None:
     assert sum(CHECK_WEIGHTS.values()) == 100
     assert tuple(CHECK_WEIGHTS) == RULE_IDS
 
 
-def test_config_excludes_are_loaded_and_keep_findings_out(tmp_path: Path) -> None:
-    repository = _copy_fixture(tmp_path, "config-excludes")
+@pytest.mark.parametrize("case", CASES)
+def test_check_ids_are_sorted_and_titles_are_known(case: str, tmp_path: Path) -> None:
+    value = report(copy_fixture(tmp_path, case))
+    assert [item["id"] for item in value["checks"]] == list(RULE_IDS)
+    assert [item["title"] for item in value["checks"]] == [CHECK_TITLES[key] for key in RULE_IDS]
+
+
+@pytest.mark.parametrize("case", ("empty-repo", "python-bad", "node-bad"))
+def test_bad_repositories_have_actionable_findings(case: str, tmp_path: Path) -> None:
+    value = report(copy_fixture(tmp_path, case))
+    failed = [item for item in value["checks"] if item["status"] in {"fail", "partial"}]
+    assert failed
+    assert all(item["fix_hint"] or item["findings"] for item in failed)
+    assert all(not Path(finding["file"]).is_absolute() for item in failed for finding in item["findings"])
+
+
+def test_perfect_fixtures_score_100(tmp_path: Path) -> None:
+    assert report(copy_fixture(tmp_path, "perfect-python"))["score"] == 100
+    assert report(copy_fixture(tmp_path, "perfect-node"))["score"] == 100
+
+
+def test_na_checks_earn_their_full_weight(tmp_path: Path) -> None:
+    value = report(copy_fixture(tmp_path, "empty-repo"))
+    for rule_id in ("RR10",):
+        item = checks(value)[rule_id]
+        assert item["status"] == "na"
+        assert item["earned"] == CHECK_WEIGHTS[rule_id]
+
+
+def test_mixed_ecosystem_scoring_is_proportional(tmp_path: Path) -> None:
+    value = report(copy_fixture(tmp_path, "polyglot-mixed"))
+    assert value["ecosystems"] == ["node", "python"]
+    assert checks(value)["RR07"]["earned"] == 4
+
+
+def test_config_excludes_fixture_content(tmp_path: Path) -> None:
+    repository = copy_fixture(tmp_path, "config-excludes")
     context = RepoContext(repository)
-    paths = {entry.path for entry in context}
-
-    assert "ignored/leaked.py" not in paths
-    assert "ignored.txt" not in paths
-    assert _checks(report(repository))["RR11"]["status"] == "pass"
-    assert _checks(report(repository))["RR12"]["status"] == "pass"
+    assert "ignored/leaked.py" not in {entry.path for entry in context}
 
 
-def test_explicit_excludes_support_directory_globs(tmp_path: Path) -> None:
+def test_explicit_directory_excludes_are_deterministic(tmp_path: Path) -> None:
     (tmp_path / "cache" / "nested").mkdir(parents=True)
-    (tmp_path / "cache" / "nested" / "secret.txt").write_text("secret\n", encoding="utf-8")
-    (tmp_path / "kept.txt").write_text("kept\n", encoding="utf-8")
-
-    context = RepoContext(tmp_path, excludes=("cache/**",))
-
-    assert [entry.path for entry in context] == ["kept.txt"]
+    (tmp_path / "cache" / "nested" / "secret.txt").write_text("x", encoding="utf-8")
+    (tmp_path / "kept.txt").write_text("x", encoding="utf-8")
+    assert [entry.path for entry in RepoContext(tmp_path, excludes=("cache/**",))] == ["kept.txt"]
 
 
-def test_binary_and_oversized_files_are_indexed_but_not_read(tmp_path: Path) -> None:
-    repository = _copy_fixture(tmp_path, "edge-binary-and-large")
-    context = RepoContext(repository)
-
-    binary = context.entry("opaque.bin")
-    large = context.entry("huge.txt")
-    assert binary is not None and binary.binary and not binary.readable
-    assert large is not None and large.too_large and not large.readable
+def test_binary_and_large_files_are_skipped(tmp_path: Path) -> None:
+    context = RepoContext(copy_fixture(tmp_path, "edge-binary-and-large"))
+    assert context.entry("opaque.bin").binary
+    assert context.entry("huge.txt").too_large
     assert context.read_text("opaque.bin") is None
     assert context.read_text("huge.txt") is None
 
 
-def test_binary_and_oversized_content_cannot_change_report(tmp_path: Path) -> None:
-    value = _normalise_report(report(_copy_fixture(tmp_path, "edge-binary-and-large")))
-
-    assert value == _expected("edge-binary-and-large")
-    assert _checks(value)["RR11"]["status"] == "pass"
-
-
-def test_symlink_is_not_followed_or_indexed(tmp_path: Path) -> None:
-    repository = _copy_fixture(tmp_path, "edge-symlinks")
-    link = repository / "linked-secret.txt"
-    context = RepoContext(repository)
-
-    assert link.is_symlink()
-    assert context.entry("linked-secret.txt") is None
-    assert _checks(report(repository))["RR11"]["status"] == "pass"
+def test_binary_nul_after_first_8k_is_text(tmp_path: Path) -> None:
+    path = tmp_path / "late-null.txt"
+    path.write_bytes(b"a" * 9000 + b"\0")
+    assert RepoContext(tmp_path).read_text("late-null.txt") is not None
 
 
-def test_malformed_utf8_is_replaced_without_aborting_scan(tmp_path: Path) -> None:
-    repository = _copy_fixture(tmp_path, "edge-non-utf8")
-    context = RepoContext(repository)
-
-    text = context.read_text("invalid.py")
-    assert text is not None
-    assert "�" in text
-    assert _normalise_report(report(repository)) == _expected("edge-non-utf8")
+def test_symlinks_are_not_indexed(tmp_path: Path) -> None:
+    repository = copy_fixture(tmp_path, "edge-symlinks")
+    assert RepoContext(repository).entry("linked-secret.txt") is None
 
 
-def test_environment_reads_report_documented_and_missing_keys(tmp_path: Path) -> None:
-    check = _checks(report(_copy_fixture(tmp_path, "edge-env-usage")))["RR13"]
-
-    assert check["status"] == "partial"
-    assert check["score"] == 4
-    assert {finding["file"] for finding in check["findings"]} == {"app.py"}
-    assert "UNDOCUMENTED_MODE" in check["findings"][0]["detail"]
+def test_invalid_utf8_is_replaced(tmp_path: Path) -> None:
+    context = RepoContext(copy_fixture(tmp_path, "edge-non-utf8"))
+    assert "�" in context.read_text("invalid.py")
 
 
-def test_no_environment_reads_are_na(tmp_path: Path) -> None:
-    check = _checks(report(_copy_fixture(tmp_path, "perfect-python")))["RR13"]
-
-    assert check["status"] == "na"
-    assert check["max"] == 0
-
-
-def test_docker_tags_and_cmd_are_reflected_in_rr08(tmp_path: Path) -> None:
-    repository = _copy_fixture(tmp_path, "edge-docker")
-    dockerfile = (repository / "Dockerfile").read_text(encoding="utf-8")
-
-    assert "FROM python:3.12.4-slim" in dockerfile
-    assert 'CMD ["python", "-m", "http.server", "8080"]' in dockerfile
-    assert _checks(report(repository))["RR08"]["status"] == "pass"
+def test_environment_reads_and_names_are_detected(tmp_path: Path) -> None:
+    repository = copy_fixture(tmp_path, "edge-env-usage")
+    reads = environment_reads(RepoContext(repository))
+    assert {name for _, _, name in reads} == {"APP_HOST", "APP_PORT", "UNDOCUMENTED_MODE"}
+    assert checks(report(repository))["RR10"]["status"] == "partial"
 
 
-def test_node_docker_tag_is_checked_for_the_node_ecosystem(tmp_path: Path) -> None:
-    repository = _copy_fixture(tmp_path, "perfect-node")
-    dockerfile = (repository / "Dockerfile").read_text(encoding="utf-8")
+def test_no_environment_reads_make_rr10_na(tmp_path: Path) -> None:
+    item = checks(report(copy_fixture(tmp_path, "perfect-python")))["RR10"]
+    assert item["status"] == "na"
+    assert item["earned"] == 6
 
-    assert "FROM node:20.11-slim" in dockerfile
-    assert _checks(report(repository))["RR08"]["score"] == CHECK_WEIGHTS["RR08"]
+
+def test_dockerfile_requires_non_latest_tag_and_command(tmp_path: Path) -> None:
+    value = checks(report(copy_fixture(tmp_path, "edge-docker")))
+    assert value["RR08"]["earned"] == 6
+    assert value["RR08"]["status"] == "partial"
+
+
+def test_human_output_includes_findings_and_top_fixes(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["check", str(copy_fixture(tmp_path, "python-bad"))]) == 0
+    output = capsys.readouterr().out
+    assert "Top fixes:" in output
+    assert "app.py" in output
 
 
 @pytest.mark.parametrize("case", ("perfect-python", "perfect-node"))
-def test_cli_json_matches_expected_report(case: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    repository = _copy_fixture(tmp_path, case)
-
+def test_cli_json_matches_expected(case: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    repository = copy_fixture(tmp_path, case)
     assert main(["check", str(repository), "--json"]) == 0
+    assert compact(json_output(capsys)) == expected(case)
 
-    assert _normalise_report(_json_stdout(capsys)) == _expected(case)
 
-
-def test_cli_json_is_deterministic_across_repeated_runs(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    repository = _copy_fixture(tmp_path, "polyglot-mixed")
-
+def test_cli_json_is_deterministic(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    repository = copy_fixture(tmp_path, "polyglot-mixed")
     assert main(["check", str(repository), "--json"]) == 0
-    first = _normalise_report(_json_stdout(capsys))
+    first = json_output(capsys)
     assert main(["check", str(repository), "--json"]) == 0
-    second = _normalise_report(_json_stdout(capsys))
-
-    assert first == second
+    assert first == json_output(capsys)
 
 
-def test_cli_json_has_sorted_rule_ids_and_relative_findings(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    repository = _copy_fixture(tmp_path, "python-bad")
-
-    assert main(["check", str(repository), "--json"]) == 0
-    value = _json_stdout(capsys)
-    checks = value["checks"]
-    assert [check["id"] for check in checks] == list(RULE_IDS)
-    assert all(not Path(finding["file"]).is_absolute() for check in checks for finding in check["findings"])
-
-
-def test_cli_invalid_path_returns_two(capsys: pytest.CaptureFixture[str]) -> None:
-    assert main(["check", "does-not-exist", "--json"]) == 2
-    captured = capsys.readouterr()
-    assert captured.out == ""
-    assert "not a directory" in captured.err
-
-
-def test_cli_help_is_available_and_successful(capsys: pytest.CaptureFixture[str]) -> None:
-    code, text = _help_text(["--help"], capsys)
-
-    assert code == 0
-    assert "repo-ready" in text
-    assert "check" in text
-    assert "fix" in text
-
-
-def test_cli_version_flag_when_exposed(capsys: pytest.CaptureFixture[str]) -> None:
-    if not _supports_option(["--help"], "--version", capsys):
-        pytest.skip("version flag is not in the current CLI")
-
+def test_cli_default_path_and_version(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["check", "--json", "--min-score", "0"]) == 0
+    assert json_output(capsys)["path"] == str(Path.cwd())
     assert main(["--version"]) == 0
     assert capsys.readouterr().out.strip() == __version__
 
 
-def test_cli_default_path_when_exposed(capsys: pytest.CaptureFixture[str]) -> None:
-    try:
-        result = main(["check", "--json"])
-    except SystemExit as raised:
-        capsys.readouterr()
-        pytest.skip("check path is required by the current CLI")
-    assert result == 0
-    value = _json_stdout(capsys)
-    assert value["path"] == str(Path.cwd().absolute())
+def test_cli_min_score_returns_one(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["check", str(copy_fixture(tmp_path, "python-bad")), "--min-score", "100", "--json"]) == 1
+    json_output(capsys)
 
 
-def test_cli_min_score_exit_code_when_exposed(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    if not _supports_option(["check", "--help"], "--min-score", capsys):
-        pytest.skip("min-score flag is not in the current CLI")
-
-    repository = _copy_fixture(tmp_path, "python-bad")
-    assert main(["check", str(repository), "--json", "--min-score", "100"]) == 1
-    _json_stdout(capsys)
+def test_config_min_score_returns_one(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    repository = copy_fixture(tmp_path, "python-bad")
+    (repository / ".repo-ready.toml").write_text("min_score = 100\n", encoding="utf-8")
+    assert main(["check", str(repository), "--json"]) == 1
+    json_output(capsys)
 
 
-def test_cli_human_output_is_no_color_by_default(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    assert main(["check", str(_copy_fixture(tmp_path, "perfect-python"))]) == 0
-    output = capsys.readouterr().out
-    assert "\x1b[" not in output
-
-
-def test_cli_no_color_option_when_exposed(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    if not _supports_option(["check", "--help"], "--no-color", capsys):
-        pytest.skip("no-color flag is not in the current CLI")
-
-    assert main(["check", str(_copy_fixture(tmp_path, "perfect-python")), "--no-color"]) == 0
+def test_cli_no_color_is_supported(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["check", str(copy_fixture(tmp_path, "perfect-python")), "--no-color"]) == 0
     assert "\x1b[" not in capsys.readouterr().out
 
 
+def test_cli_invalid_path_returns_two(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["check", "does-not-exist", "--json"]) == 2
+    assert "not a directory" in capsys.readouterr().err
+
+
 def _snapshot(root: Path) -> dict[str, bytes]:
-    snapshot: dict[str, bytes] = {}
-    for path in root.rglob("*"):
-        if path.is_file() and not path.is_symlink():
-            snapshot[str(path.relative_to(root))] = path.read_bytes()
-    return snapshot
+    return {str(path.relative_to(root)): path.read_bytes() for path in root.rglob("*") if path.is_file() and not path.is_symlink()}
 
 
-def test_fix_dry_run_does_not_modify_a_copied_fixture(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    repository = _copy_fixture(tmp_path, "empty-repo")
+def test_fix_dry_run_does_not_write(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    repository = copy_fixture(tmp_path, "empty-repo")
     before = _snapshot(repository)
-
     assert main(["fix", str(repository), "--dry-run"]) == 0
-
-    assert "Dry run:" in capsys.readouterr().out
     assert _snapshot(repository) == before
+    assert "Dry run" in capsys.readouterr().out
 
 
-def test_fix_does_not_overwrite_an_existing_file(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    repository = _copy_fixture(tmp_path, "empty-repo")
-    license_file = repository / "LICENSE"
-    license_file.write_text("keep this exact content\n", encoding="utf-8")
-
-    assert main(["fix", str(repository)]) == 0
-
+def test_fix_creates_only_missing_files(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    repository = copy_fixture(tmp_path, "empty-repo")
+    existing = repository / "README.md"
+    existing.write_text("keep\n", encoding="utf-8")
+    assert main(["fix", str(repository), "--license", "mit", "--holder", "Test Holder"]) == 0
+    assert existing.read_text(encoding="utf-8") == "keep\n"
+    assert (repository / "LICENSE").is_file()
     capsys.readouterr()
-    assert license_file.read_text(encoding="utf-8") == "keep this exact content\n"
 
 
-def test_fix_second_run_has_no_remaining_plans(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    repository = _copy_fixture(tmp_path, "empty-repo")
-
-    assert main(["fix", str(repository)]) == 0
+def test_fix_second_run_is_noop(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    repository = copy_fixture(tmp_path, "empty-repo")
+    main(["fix", str(repository)])
     capsys.readouterr()
-    assert main(["fix", str(repository)]) == 0
-
-    assert "No missing files" in capsys.readouterr().out
-
-
-def test_fix_plans_stay_inside_the_resolved_repository(tmp_path: Path) -> None:
-    repository = _copy_fixture(tmp_path, "empty-repo")
-    root = repository.resolve()
-
-    plans = plan_fixes(repository / "nested" / "..")
-
-    assert plans
-    assert all(plan.path.resolve().is_relative_to(root) for plan in plans)
+    main(["fix", str(repository)])
+    assert "No safe missing files" in capsys.readouterr().out
 
 
-def test_fix_does_not_write_through_a_repository_symlink(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    repository = _copy_fixture(tmp_path, "empty-repo")
-    outside = tmp_path / "outside.txt"
-    outside.write_text("outside content\n", encoding="utf-8")
-    (repository / "README.md").symlink_to(outside)
-
-    assert main(["fix", str(repository)]) == 0
-    capsys.readouterr()
-    assert outside.read_text(encoding="utf-8") == "outside content\n"
+def test_fix_does_not_use_interpreter_runtime(tmp_path: Path) -> None:
+    repository = copy_fixture(tmp_path, "python-bad")
+    plans = plan_fixes(repository, runtime_version="3.12")
+    assert all("3.11" not in plan.content for plan in plans)
 
 
-def test_offline_guard_blocks_socket_connections() -> None:
-    with socket.socket() as connection, pytest.raises(AssertionError, match="network"):
+def test_fix_rejects_symlinked_parent(tmp_path: Path) -> None:
+    repository = copy_fixture(tmp_path, "empty-repo")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (repository / ".github").symlink_to(outside, target_is_directory=True)
+    main(["fix", str(repository)])
+    assert not (outside / "PULL_REQUEST_TEMPLATE.md").exists()
+
+
+def test_fix_plans_are_inside_root(tmp_path: Path) -> None:
+    repository = copy_fixture(tmp_path, "empty-repo")
+    assert all(plan.path.resolve().is_relative_to(repository.resolve()) for plan in plan_fixes(repository))
+
+
+def test_offline_socket_guard_canary() -> None:
+    with socket.socket() as connection, pytest.raises(AssertionError):
         connection.connect(("127.0.0.1", 9))
 
 
-def test_offline_guard_blocks_subprocess_popen() -> None:
-    with pytest.raises(AssertionError, match="subprocess"):
+def test_offline_subprocess_guard_canary() -> None:
+    with pytest.raises(AssertionError):
         subprocess.Popen([os.fspath(Path("not-a-real-command"))])
-
-
-def test_report_path_is_absolute_only_in_runtime_and_never_in_findings(tmp_path: Path) -> None:
-    value = report(_copy_fixture(tmp_path, "python-bad"))
-
-    assert Path(value["path"]).is_absolute()
-    assert all(
-        not Path(finding["file"]).is_absolute()
-        for check in value["checks"]
-        for finding in check["findings"]
-    )

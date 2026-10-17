@@ -27,10 +27,5 @@ def offline_guard(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(subprocess, "Popen", blocked)
 
 
-# Fixture repositories are data, not pytest packages.  The list is kept for
-# compatibility with the original layout while the current fixtures all use a
-# dedicated ``repo/`` child directory.
-collect_ignore = [
-    str(PROJECT_ROOT / "tests" / "fixtures" / "python-complete" / "tests" / "test_example.py"),
-]
+# Fixture repositories are data, not pytest packages.
 collect_ignore_glob = ["fixtures/**/repo/**/test_*.py"]
