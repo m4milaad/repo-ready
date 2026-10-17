@@ -475,6 +475,134 @@ def test_fix_dry_run_json_does_not_write(tmp_path: Path, capsys: pytest.CaptureF
     assert _snapshot(repository) == before
 
 
+def test_fix_dry_run_json_reports_projected_scores_and_counts_without_writing(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repository = copy_fixture(tmp_path, "empty-repo")
+    before = _snapshot(repository)
+    score_before = int(report(repository)["score"])
+
+    assert main(["fix", str(repository), "--dry-run", "--json"]) == 0
+    value = json_output(capsys)
+
+    assert {"score_before", "score_after", "created_count", "manual_count"} <= value.keys()
+    assert value["score_before"] == score_before
+    assert value["score_after"] >= value["score_before"]
+    assert value["created_count"] == len(value["would_create"])
+    assert value["manual_count"] == len(value["manual"])
+    assert _snapshot(repository) == before
+
+
+def test_fix_projected_and_actual_scores_agree_and_actual_scores_are_reported(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    projected_repository = copy_fixture(tmp_path, "empty-repo")
+    normal_root = tmp_path / "normal"
+    normal_root.mkdir()
+    normal_repository = copy_fixture(normal_root, "empty-repo")
+    score_before = int(report(normal_repository)["score"])
+
+    assert main(["fix", str(projected_repository), "--dry-run", "--json"]) == 0
+    projected = json_output(capsys)
+
+    assert main(["fix", str(normal_repository), "--json"]) == 0
+    actual = json_output(capsys)
+
+    assert projected["score_before"] == score_before
+    assert actual["score_before"] == score_before
+    assert actual["score_after"] == int(report(normal_repository)["score"])
+    assert projected["score_after"] == actual["score_after"]
+    assert projected["score_after"] >= projected["score_before"]
+    assert actual["score_after"] >= actual["score_before"]
+
+
+@pytest.mark.parametrize("dry_run", (True, False))
+def test_fix_perfect_repository_remains_100_and_manual_items_remain_counted(
+    dry_run: bool,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repository = copy_fixture(tmp_path, "perfect-python")
+    before = _snapshot(repository)
+    arguments = ["fix", str(repository), "--json"]
+    if dry_run:
+        arguments.insert(2, "--dry-run")
+
+    assert main(arguments) == 0
+    value = json_output(capsys)
+
+    assert value["score_before"] == value["score_after"] == 100
+    assert value["created_count"] == 0
+    assert value["manual_count"] == len(value["manual"]) > 0
+    assert value["would_create"] == []
+    if dry_run:
+        assert _snapshot(repository) == before
+    else:
+        assert int(report(repository)["score"]) == 100
+
+
+def test_fix_summary_does_not_count_existing_files_as_created(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repository = copy_fixture(tmp_path, "empty-repo")
+    (repository / "README.md").write_bytes(b"keep these exact bytes\r\n")
+
+    assert main(["fix", str(repository), "--json"]) == 0
+    value = json_output(capsys)
+
+    assert value["created_count"] == len(value["created"])
+    assert "README.md" not in value["created"]
+    assert any(item["path"] == "README.md" for item in value["skipped_existing"])
+    assert value["manual_count"] == len(value["manual"]) > 0
+
+
+def test_fix_rejects_machine_specific_license_holder_without_lowering_score(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repository = copy_fixture(tmp_path, "perfect-python")
+    (repository / "LICENSE").unlink()
+    before = int(report(repository)["score"])
+    machine_holder = "/" + "home/alice/project"
+
+    assert main(
+        [
+            "fix",
+            str(repository),
+            "--license",
+            "mit",
+            "--holder",
+            machine_holder,
+            "--json",
+        ]
+    ) == 0
+    value = json_output(capsys)
+
+    assert value["score_before"] == before
+    assert value["score_after"] == before
+    assert any(
+        item["path"] == "LICENSE" and item["action"] == "manual"
+        for item in value["manual"]
+    )
+    assert not (repository / "LICENSE").exists()
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="named pipes are unavailable")
+def test_fix_dry_run_ignores_special_files(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    repository = copy_fixture(tmp_path, "empty-repo")
+    os.mkfifo(repository / "ignored-pipe")
+
+    assert main(["fix", str(repository), "--dry-run", "--json"]) == 0
+    value = json_output(capsys)
+
+    assert value["score_after"] >= value["score_before"]
+    assert value["dry_run"] is True
+    assert (repository / "ignored-pipe").exists()
+
+
 def test_fix_second_run_is_noop(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     repository = copy_fixture(tmp_path, "empty-repo")
     assert main(["fix", str(repository), "--json"]) == 0

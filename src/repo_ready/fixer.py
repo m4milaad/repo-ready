@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import tempfile
 import tomllib
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
@@ -11,6 +13,7 @@ from pathlib import Path, PurePosixPath
 from .checks import environment_reads
 from .context import RepoContext
 from .detector import detect_ecosystems
+from .scoring import report
 
 
 @dataclass(frozen=True)
@@ -125,6 +128,11 @@ jobs:
       - run: python -m pytest -q
 """
 _DOCKERIGNORE = ".git\n.venv\n__pycache__\n.pytest_cache\n.env\n"
+_MACHINE_PATHS = (
+    re.compile(r"(?<![A-Za-z0-9_])/(?:Users|home)/[^/\s]+/"),
+    re.compile(r"(?i)(?<![A-Za-z0-9_])[A-Z]:[\\/]Users[\\/][^\\/\s]+[\\/]"),
+    re.compile(r"(?<![A-Za-z0-9_])\\\\(?:Users|home)\\\\[^\\\s]+\\\\"),
+)
 
 
 def _trusted_root(root: str | Path) -> Path | None:
@@ -219,6 +227,10 @@ def _node_runtime(context: RepoContext, explicit: str | None) -> str | None:
     value = engines.get("node") if isinstance(engines, dict) else None
     match = re.search(r"(?<!\d)(\d+(?:\.\d+){0,2})", value) if isinstance(value, str) else None
     return match.group(1) if match else None
+
+
+def _contains_machine_path(text: str) -> bool:
+    return any(pattern.search(text) for pattern in _MACHINE_PATHS)
 
 
 def _dockerfile(ecosystems: list[str], runtime: str) -> str:
@@ -330,7 +342,18 @@ def plan_fixes(
     if license_path:
         skip_existing(license_path, "license")
     elif license_name == "mit" and holder:
-        add("LICENSE", _MIT.format(holder=holder), "MIT license requested explicitly")
+        license_content = _MIT.format(holder=holder)
+        if _contains_machine_path(license_content):
+            plans.append(
+                PlannedFile(
+                    trusted / "LICENSE",
+                    "",
+                    "The requested license holder contains a machine-specific path; edit the holder and create the license manually.",
+                    "manual",
+                )
+            )
+        else:
+            add("LICENSE", license_content, "MIT license requested explicitly")
     else:
         plans.append(
             PlannedFile(
@@ -497,6 +520,78 @@ def apply_fix_plan(
     return outcomes
 
 
+def project_fix_score(
+    root: str | Path,
+    outcomes: list[PlannedFile],
+) -> int:
+    """Score create operations in an isolated copy of *root*.
+
+    Dry-run scoring must see the same repository files as a real scan plus
+    the create operations that would be applied.  The copy is made with
+    standard-library filesystem operations and the existing fix-plan and
+    report APIs; the target repository is never modified.
+    """
+
+    trusted = _trusted_root(root)
+    if trusted is None:
+        return 0
+    with tempfile.TemporaryDirectory(prefix="repo-ready-fix-") as temporary:
+        projected_root = Path(temporary) / "repository"
+        projected_root.mkdir(parents=True)
+        context = RepoContext(trusted)
+        for entry in context:
+            destination = projected_root / entry.path
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(entry.absolute, destination)
+            except OSError:
+                continue
+        projected_plans: list[PlannedFile] = []
+        for operation in outcomes:
+            if operation.action != "create":
+                continue
+            try:
+                relative = operation.path.relative_to(trusted)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            projected_plans.append(
+                PlannedFile(relative, operation.content, operation.reason)
+            )
+        apply_fix_plan(projected_plans, root=projected_root)
+        return int(report(projected_root)["score"])
+
+
+def protect_score(
+    root: str | Path,
+    plans: list[PlannedFile],
+    score_before: int,
+) -> list[PlannedFile]:
+    """Convert score-decreasing creations into manual operations.
+
+    Fixing a repository must not silently make its readiness score worse. The
+    proposed files are evaluated in an isolated copy before any target write;
+    if the projection regresses, the create operations are retained as an
+    explainable manual item instead of being applied.
+    """
+
+    projected = project_fix_score(root, plans)
+    if projected >= score_before:
+        return plans
+    return [
+        replace(
+            operation,
+            action="manual",
+            reason=(
+                f"{operation.reason}; creating this file would lower the score "
+                "and was not applied."
+            ),
+        )
+        if operation.action == "create"
+        else operation
+        for operation in plans
+    ]
+
+
 def apply_fixes(plans: list[PlannedFile], *, root: str | Path, dry_run: bool = False) -> list[Path]:
     """Compatibility wrapper returning paths for create operations only."""
 
@@ -507,4 +602,11 @@ def apply_fixes(plans: list[PlannedFile], *, root: str | Path, dry_run: bool = F
     ]
 
 
-__all__ = ["PlannedFile", "apply_fix_plan", "apply_fixes", "plan_fixes"]
+__all__ = [
+    "PlannedFile",
+    "apply_fix_plan",
+    "apply_fixes",
+    "plan_fixes",
+    "project_fix_score",
+    "protect_score",
+]

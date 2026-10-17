@@ -10,7 +10,7 @@ from pathlib import Path
 
 from . import __version__
 from .context import RepoContext
-from .fixer import PlannedFile, apply_fix_plan, plan_fixes
+from .fixer import PlannedFile, apply_fix_plan, plan_fixes, project_fix_score, protect_score
 from .scoring import report
 
 
@@ -110,17 +110,42 @@ def _run_check(args: argparse.Namespace, repository: Path) -> int:
 
 
 def _run_fix(args: argparse.Namespace, repository: Path) -> int:
+    before = report(repository)
+    score_before = int(before["score"])
     plans = plan_fixes(
         repository,
         license_name=args.license_name,
         holder=args.holder,
         runtime_version=args.runtime_version,
     )
+    plans = protect_score(repository, plans, score_before)
     outcomes = apply_fix_plan(plans, root=repository, dry_run=args.dry_run)
-    if args.as_json:
-        print(json.dumps(_fix_result(repository, outcomes, dry_run=args.dry_run), indent=2))
+    if args.dry_run:
+        score_after = project_fix_score(repository, outcomes)
     else:
-        _print_fix_report(repository, outcomes, dry_run=args.dry_run)
+        after = report(repository)
+        score_after = int(after["score"])
+    if args.as_json:
+        print(
+            json.dumps(
+                _fix_result(
+                    repository,
+                    outcomes,
+                    dry_run=args.dry_run,
+                    score_before=score_before,
+                    score_after=score_after,
+                ),
+                indent=2,
+            )
+        )
+    else:
+        _print_fix_report(
+            repository,
+            outcomes,
+            dry_run=args.dry_run,
+            score_before=score_before,
+            score_after=score_after,
+        )
     return 0
 
 
@@ -128,7 +153,14 @@ def _fix_item(operation: PlannedFile, repository: Path) -> dict[str, str]:
     return operation.as_dict(repository)
 
 
-def _fix_result(repository: Path, outcomes: list[PlannedFile], *, dry_run: bool) -> dict[str, object]:
+def _fix_result(
+    repository: Path,
+    outcomes: list[PlannedFile],
+    *,
+    dry_run: bool,
+    score_before: int,
+    score_after: int,
+) -> dict[str, object]:
     creates = [operation for operation in outcomes if operation.action == "create"]
     existing = [operation for operation in outcomes if operation.action == "skip-existing"]
     unsafe = [operation for operation in outcomes if operation.action == "skip-unsafe"]
@@ -143,10 +175,21 @@ def _fix_result(repository: Path, outcomes: list[PlannedFile], *, dry_run: bool)
         "skipped_existing": [_fix_item(operation, repository) for operation in existing],
         "skipped_unsafe": [_fix_item(operation, repository) for operation in unsafe],
         "manual": [_fix_item(operation, repository) for operation in manual],
+        "score_before": score_before,
+        "score_after": score_after,
+        "created_count": len(creates),
+        "manual_count": len(manual),
     }
 
 
-def _print_fix_report(repository: Path, outcomes: list[PlannedFile], *, dry_run: bool) -> None:
+def _print_fix_report(
+    repository: Path,
+    outcomes: list[PlannedFile],
+    *,
+    dry_run: bool,
+    score_before: int,
+    score_after: int,
+) -> None:
     creates = [operation for operation in outcomes if operation.action == "create"]
     existing = [operation for operation in outcomes if operation.action == "skip-existing"]
     unsafe = [operation for operation in outcomes if operation.action == "skip-unsafe"]
@@ -181,6 +224,12 @@ def _print_fix_report(repository: Path, outcomes: list[PlannedFile], *, dry_run:
             print(f"  {_fix_path(operation, repository)} — {operation.reason}")
     else:
         print("Manual items: none.")
+
+    print(f"Score before: {score_before}/100")
+    projection = " (projected)" if dry_run else ""
+    print(f"Score after: {score_after}/100{projection}")
+    print(f"Created count: {len(creates)}")
+    print(f"Manual count: {len(manual)}")
 
     if dry_run:
         print("Dry run: no files were written.")
