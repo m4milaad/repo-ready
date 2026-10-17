@@ -170,6 +170,9 @@ def test_binary_nul_after_first_8k_is_text(tmp_path: Path) -> None:
 
 def test_symlinks_are_not_indexed(tmp_path: Path) -> None:
     repository = copy_fixture(tmp_path, "edge-symlinks")
+    outside = tmp_path / "outside-secret.txt"
+    outside.write_text("password=do-not-scan-this\n", encoding="utf-8")
+    (repository / "linked-secret.txt").symlink_to(outside)
     assert RepoContext(repository).entry("linked-secret.txt") is None
 
 
