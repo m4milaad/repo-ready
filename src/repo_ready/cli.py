@@ -9,7 +9,7 @@ from pathlib import Path
 
 from . import __version__
 from .context import RepoContext
-from .fixer import apply_fixes, plan_fixes
+from .fixer import PlannedFile, apply_fix_plan, plan_fixes
 from .scoring import report
 
 
@@ -30,6 +30,7 @@ def _parser() -> argparse.ArgumentParser:
     fix.add_argument("--license", choices=("mit",), dest="license_name")
     fix.add_argument("--holder", default=None)
     fix.add_argument("--runtime-version", default=None)
+    fix.add_argument("--json", action="store_true", dest="as_json")
     return parser
 
 
@@ -90,21 +91,81 @@ def _run_fix(args: argparse.Namespace, repository: Path) -> int:
         holder=args.holder,
         runtime_version=args.runtime_version,
     )
-    completed = apply_fixes(plans, root=repository, dry_run=args.dry_run)
-    action = "Would create" if args.dry_run else "Created"
-    for path in completed:
-        print(f"{action} {path.relative_to(repository)}")
-    if not completed:
-        print("No safe missing files can be scaffolded.")
+    outcomes = apply_fix_plan(plans, root=repository, dry_run=args.dry_run)
+    if args.as_json:
+        print(json.dumps(_fix_result(repository, outcomes, dry_run=args.dry_run), indent=2))
     else:
-        print(f"{action} {len(completed)} file(s).")
-    print("Skipped existing files: none were overwritten.")
-    print("Manual items: lockfiles, test commands, and machine-specific paths require human changes.")
-    if args.license_name != "mit" or not args.holder:
-        print("Manual item: LICENSE is created only with --license mit --holder NAME.")
-    if args.dry_run:
-        print("Dry run: no files were written.")
+        _print_fix_report(repository, outcomes, dry_run=args.dry_run)
     return 0
+
+
+def _fix_item(operation: PlannedFile, repository: Path) -> dict[str, str]:
+    return operation.as_dict(repository)
+
+
+def _fix_result(repository: Path, outcomes: list[PlannedFile], *, dry_run: bool) -> dict[str, object]:
+    creates = [operation for operation in outcomes if operation.action == "create"]
+    existing = [operation for operation in outcomes if operation.action == "skip-existing"]
+    unsafe = [operation for operation in outcomes if operation.action == "skip-unsafe"]
+    manual = [operation for operation in outcomes if operation.action == "manual"]
+    return {
+        "tool": "repo-ready",
+        "path": str(repository),
+        "dry_run": dry_run,
+        "operations": [_fix_item(operation, repository) for operation in outcomes],
+        "created": [] if dry_run else [_fix_path(operation, repository) for operation in creates],
+        "would_create": [_fix_path(operation, repository) for operation in creates] if dry_run else [],
+        "skipped_existing": [_fix_item(operation, repository) for operation in existing],
+        "skipped_unsafe": [_fix_item(operation, repository) for operation in unsafe],
+        "manual": [_fix_item(operation, repository) for operation in manual],
+    }
+
+
+def _print_fix_report(repository: Path, outcomes: list[PlannedFile], *, dry_run: bool) -> None:
+    creates = [operation for operation in outcomes if operation.action == "create"]
+    existing = [operation for operation in outcomes if operation.action == "skip-existing"]
+    unsafe = [operation for operation in outcomes if operation.action == "skip-unsafe"]
+    manual = [operation for operation in outcomes if operation.action == "manual"]
+
+    action = "Would create" if dry_run else "Created"
+    if creates:
+        print(f"{action}:")
+        for operation in creates:
+            print(f"  {_fix_path(operation, repository)} — {operation.reason}")
+        print(f"{action} {len(creates)} file(s).")
+    else:
+        print("No safe missing files can be scaffolded.")
+
+    if existing:
+        print("Skipped existing files:")
+        for operation in existing:
+            print(f"  {_fix_path(operation, repository)} — {operation.reason}")
+    else:
+        print("Skipped existing files: none were overwritten.")
+
+    if unsafe:
+        print("Skipped unsafe files:")
+        for operation in unsafe:
+            print(f"  {_fix_path(operation, repository)} — {operation.reason}")
+    else:
+        print("Skipped unsafe files: none.")
+
+    if manual:
+        print("Manual items:")
+        for operation in manual:
+            print(f"  {_fix_path(operation, repository)} — {operation.reason}")
+    else:
+        print("Manual items: none.")
+
+    if dry_run:
+        print("Dry run: no files were written.")
+
+
+def _fix_path(operation: PlannedFile, repository: Path) -> str:
+    try:
+        return operation.path.relative_to(repository).as_posix()
+    except ValueError:
+        return operation.path.as_posix()
 
 
 def main(argv: list[str] | None = None) -> int:

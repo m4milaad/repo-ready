@@ -14,7 +14,7 @@ from repo_ready.checks import CHECK_TITLES, CHECK_WEIGHTS, environment_reads
 from repo_ready.cli import main
 from repo_ready.context import RepoContext
 from repo_ready.detector import detect_ecosystems
-from repo_ready.fixer import plan_fixes
+from repo_ready.fixer import PlannedFile, apply_fix_plan, plan_fixes
 from repo_ready.scoring import report
 
 
@@ -319,22 +319,159 @@ def test_fix_dry_run_does_not_write(tmp_path: Path, capsys: pytest.CaptureFixtur
     assert "Dry run" in capsys.readouterr().out
 
 
-def test_fix_creates_only_missing_files(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_fix_plan_operations_are_inspectable(tmp_path: Path) -> None:
+    repository = copy_fixture(tmp_path, "empty-repo")
+    (repository / "README.md").write_bytes(b"keep these exact bytes\r\n")
+
+    plans = plan_fixes(repository)
+
+    assert {operation.action for operation in plans} == {"create", "skip-existing", "manual"}
+    assert all(operation.status == operation.action for operation in plans)
+    assert all(operation.reason for operation in plans)
+    readme = next(operation for operation in plans if operation.path.name == "README.md")
+    assert readme.action == "skip-existing"
+    assert "already exists" in readme.reason
+    assert readme.as_dict(repository) == {
+        "action": "skip-existing",
+        "path": "README.md",
+        "reason": readme.reason,
+    }
+    assert any(operation.action == "create" and operation.reason == "contributor guide" for operation in plans)
+
+
+def test_fix_creates_only_missing_files_and_preserves_existing_bytes(tmp_path: Path) -> None:
     repository = copy_fixture(tmp_path, "empty-repo")
     existing = repository / "README.md"
-    existing.write_text("keep\n", encoding="utf-8")
-    assert main(["fix", str(repository), "--license", "mit", "--holder", "Test Holder"]) == 0
-    assert existing.read_text(encoding="utf-8") == "keep\n"
+    existing.write_bytes(b"keep\r\nexactly\x00")
+    before = _snapshot(repository)
+    outcomes = apply_fix_plan(
+        plan_fixes(repository, license_name="mit", holder="Test Holder"),
+        root=repository,
+    )
+
+    after = _snapshot(repository)
+    assert all(after[path] == content for path, content in before.items())
+    assert any(operation.action == "skip-existing" and operation.path == existing for operation in outcomes)
     assert (repository / "LICENSE").is_file()
-    capsys.readouterr()
+    assert any(operation.action == "create" and operation.path == repository / "LICENSE" for operation in outcomes)
+
+
+def test_fix_human_summary_lists_created_existing_and_manual_items(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repository = copy_fixture(tmp_path, "empty-repo")
+    (repository / "README.md").write_text("keep\n", encoding="utf-8")
+
+    assert main(["fix", str(repository)]) == 0
+    output = capsys.readouterr().out
+
+    assert "Created:" in output
+    assert "Skipped existing files:" in output
+    assert "README.md" in output
+    assert "Manual items:" in output
+    assert "lockfiles (manual)" in output
+    assert "tests (manual)" in output
+    assert "machine-specific paths (manual)" in output
+
+
+def test_fix_json_summary_lists_created_existing_and_manual_items(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repository = copy_fixture(tmp_path, "empty-repo")
+    (repository / "README.md").write_text("keep\n", encoding="utf-8")
+
+    assert main(["fix", str(repository), "--json"]) == 0
+    value = json_output(capsys)
+
+    assert value["dry_run"] is False
+    assert value["created"]
+    assert value["would_create"] == []
+    assert any(item["path"] == "README.md" and item["action"] == "skip-existing" for item in value["skipped_existing"])
+    manual_paths = {item["path"] for item in value["manual"]}
+    assert {"lockfiles (manual)", "tests (manual)", "machine-specific paths (manual)"} <= manual_paths
+    assert {item["action"] for item in value["operations"]} >= {"create", "skip-existing", "manual"}
+    assert all(item["reason"] for item in value["operations"])
+
+
+def test_fix_dry_run_json_does_not_write(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    repository = copy_fixture(tmp_path, "empty-repo")
+    before = _snapshot(repository)
+
+    assert main(["fix", str(repository), "--dry-run", "--json"]) == 0
+    value = json_output(capsys)
+
+    assert value["dry_run"] is True
+    assert value["created"] == []
+    assert value["would_create"]
+    assert any(item["action"] == "create" for item in value["operations"])
+    assert any(item["action"] == "manual" for item in value["operations"])
+    assert _snapshot(repository) == before
 
 
 def test_fix_second_run_is_noop(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     repository = copy_fixture(tmp_path, "empty-repo")
-    main(["fix", str(repository)])
-    capsys.readouterr()
-    main(["fix", str(repository)])
-    assert "No safe missing files" in capsys.readouterr().out
+    assert main(["fix", str(repository), "--json"]) == 0
+    json_output(capsys)
+    after_first = _snapshot(repository)
+
+    assert main(["fix", str(repository), "--json"]) == 0
+    value = json_output(capsys)
+
+    assert _snapshot(repository) == after_first
+    assert value["created"] == []
+    assert value["would_create"] == []
+    assert value["skipped_existing"]
+    assert value["manual"]
+    assert all(item["action"] != "create" for item in value["operations"])
+
+
+@pytest.mark.parametrize(
+    ("manifest", "contents", "runtime_path"),
+    (
+        ("pyproject.toml", "[project]\nname = 'unknown-runtime'\n", ".python-version"),
+        ("package.json", '{"name": "unknown-runtime"}\n', ".nvmrc"),
+    ),
+)
+def test_unknown_runtime_is_manual_not_taken_from_interpreter(
+    manifest: str,
+    contents: str,
+    runtime_path: str,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / manifest).write_text(contents, encoding="utf-8")
+
+    plans = plan_fixes(tmp_path)
+
+    runtime = next(operation for operation in plans if operation.path.name == runtime_path)
+    docker = next(operation for operation in plans if operation.path.name == "Dockerfile")
+    assert runtime.action == "manual"
+    assert runtime.content == ""
+    assert "unknown" in runtime.reason.lower()
+    assert docker.action == "manual"
+    assert "known runtime" in docker.reason
+    assert not (tmp_path / runtime_path).exists()
+
+
+def test_lockfile_test_and_hardcoded_path_work_remain_manual(tmp_path: Path) -> None:
+    repository = copy_fixture(tmp_path, "python-bad")
+
+    manual = {
+        operation.path.name: operation
+        for operation in plan_fixes(repository)
+        if operation.action == "manual"
+    }
+
+    assert {
+        "lockfiles (manual)",
+        "tests (manual)",
+        "machine-specific paths (manual)",
+    } <= manual.keys()
+    assert "Lockfiles are never created automatically" in manual["lockfiles (manual)"].reason
+    assert "Tests and test commands are never created automatically" in manual["tests (manual)"].reason
+    assert "Machine-specific absolute paths are never rewritten automatically" in manual["machine-specific paths (manual)"].reason
+    assert all(operation.content == "" for operation in manual.values())
 
 
 def test_fix_does_not_use_interpreter_runtime(tmp_path: Path) -> None:
@@ -348,8 +485,30 @@ def test_fix_rejects_symlinked_parent(tmp_path: Path) -> None:
     outside = tmp_path / "outside"
     outside.mkdir()
     (repository / ".github").symlink_to(outside, target_is_directory=True)
-    main(["fix", str(repository)])
+
+    plans = plan_fixes(repository)
+    unsafe = [operation for operation in plans if operation.action == "skip-unsafe"]
+    outcomes = apply_fix_plan(plans, root=repository)
+
+    assert unsafe
+    assert all("parent path is a symlink" in operation.reason for operation in unsafe)
+    assert any(operation.action == "skip-unsafe" for operation in outcomes)
     assert not (outside / "PULL_REQUEST_TEMPLATE.md").exists()
+    assert not any(outside.rglob("*"))
+
+
+def test_apply_fix_plan_rejects_targets_outside_root(tmp_path: Path) -> None:
+    repository = copy_fixture(tmp_path, "empty-repo")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    operation = PlannedFile(outside / "escape.txt", "must not be written", "test containment")
+
+    outcomes = apply_fix_plan([operation], root=repository)
+
+    assert len(outcomes) == 1
+    assert outcomes[0].action == "skip-unsafe"
+    assert "escapes the repository root" in outcomes[0].reason
+    assert not (outside / "escape.txt").exists()
 
 
 def test_fix_plans_are_inside_root(tmp_path: Path) -> None:
