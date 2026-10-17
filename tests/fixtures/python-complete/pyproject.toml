@@ -1,9 +1,0 @@
-[project]
-name = "complete-python-fixture"
-version = "1.0.0"
-requires-python = ">=3.11,<3.12"
-dependencies = []
-
-[build-system]
-requires = []
-build-backend = "complete_python_fixture.build"

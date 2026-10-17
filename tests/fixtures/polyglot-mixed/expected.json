@@ -1,0 +1,155 @@
+{
+  "tool": "repo-ready",
+  "version": "0.1.0",
+  "path": "<REPO>",
+  "ecosystems": [
+    "python",
+    "node"
+  ],
+  "score": 82,
+  "max": 94,
+  "grade": "B",
+  "checks": [
+    {
+      "id": "RR01",
+      "message": "README documents requirements, setup, run, test, and rebuild.",
+      "weight": 14,
+      "status": "pass",
+      "score": 14,
+      "max": 14,
+      "findings": []
+    },
+    {
+      "id": "RR02",
+      "message": "A license file is present.",
+      "weight": 6,
+      "status": "pass",
+      "score": 6,
+      "max": 6,
+      "findings": []
+    },
+    {
+      "id": "RR03",
+      "message": "Contributor guidance is present.",
+      "weight": 6,
+      "status": "pass",
+      "score": 6,
+      "max": 6,
+      "findings": []
+    },
+    {
+      "id": "RR04",
+      "message": "Pull-request and issue templates are present.",
+      "weight": 4,
+      "status": "pass",
+      "score": 4,
+      "max": 4,
+      "findings": []
+    },
+    {
+      "id": "RR05",
+      "message": "Supported ecosystem metadata is valid and identifiable.",
+      "weight": 4,
+      "status": "partial",
+      "score": 2,
+      "max": 4,
+      "findings": [
+        {
+          "file": "package.json",
+          "line": null,
+          "detail": "Node package metadata is incomplete."
+        }
+      ]
+    },
+    {
+      "id": "RR06",
+      "message": "Declared dependencies have a usable lockfile.",
+      "weight": 10,
+      "status": "partial",
+      "score": 5,
+      "max": 10,
+      "findings": [
+        {
+          "file": "package-lock.json",
+          "line": null,
+          "detail": "Node dependency lockfile is missing."
+        }
+      ]
+    },
+    {
+      "id": "RR07",
+      "message": "Supported runtimes are pinned.",
+      "weight": 8,
+      "status": "partial",
+      "score": 4,
+      "max": 8,
+      "findings": [
+        {
+          "file": ".nvmrc",
+          "line": null,
+          "detail": "Node runtime is not pinned to a numeric version."
+        }
+      ]
+    },
+    {
+      "id": "RR08",
+      "message": "A rebuildable Dockerfile is present.",
+      "weight": 12,
+      "status": "partial",
+      "score": 11,
+      "max": 12,
+      "findings": [
+        {
+          "file": "Dockerfile",
+          "line": null,
+          "detail": "Dockerfile base image should identify node."
+        }
+      ]
+    },
+    {
+      "id": "RR09",
+      "message": "A deterministic test command is documented.",
+      "weight": 12,
+      "status": "pass",
+      "score": 12,
+      "max": 12,
+      "findings": []
+    },
+    {
+      "id": "RR10",
+      "message": "An example environment file documents configuration keys.",
+      "weight": 6,
+      "status": "pass",
+      "score": 6,
+      "max": 6,
+      "findings": []
+    },
+    {
+      "id": "RR11",
+      "message": "No likely hard-coded secrets are committed.",
+      "weight": 8,
+      "status": "pass",
+      "score": 8,
+      "max": 8,
+      "findings": []
+    },
+    {
+      "id": "RR12",
+      "message": "No machine-specific absolute paths are committed.",
+      "weight": 4,
+      "status": "pass",
+      "score": 4,
+      "max": 4,
+      "findings": []
+    },
+    {
+      "id": "RR13",
+      "message": "Environment reads are represented in the example configuration.",
+      "weight": 6,
+      "status": "na",
+      "score": 0,
+      "max": 0,
+      "findings": []
+    }
+  ]
+}

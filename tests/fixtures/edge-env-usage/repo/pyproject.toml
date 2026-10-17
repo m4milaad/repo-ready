@@ -1,0 +1,4 @@
+[project]
+name = "edge-env-usage"
+version = "1.0.0"
+dependencies = ["fixture-lib==1.0.0"]

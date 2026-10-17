@@ -1,55 +1,28 @@
-# Detector fixtures
+# Readiness report fixtures
 
-These directories are small, deterministic local repositories for the future
-repository-readiness detector. They do not require network access or any
-machine-specific paths, and they intentionally do not contain pytest tests.
+Each fixture is a self-contained repository in `<case>/repo` and has a
+deterministic `<case>/expected.json` report. The expected report uses
+`"<REPO>"` for its path so copied temporary repositories can be compared
+without host-specific values.
 
-## Repositories
+Cases:
 
-- `python-complete/` — a complete Python repository with every check enabled.
-- `python-minimal/` — a recognizable but intentionally incomplete Python
-  repository.
-- `node-complete/` — a complete Node repository with every check enabled.
-- `empty-incomplete/` — an empty repository containing only its fixture
-  expectation.
+- `perfect-python` — complete Python repository.
+- `perfect-node` — complete Node repository.
+- `empty-repo` — repository with no detectable ecosystem.
+- `python-bad` — Python metadata, secret, path, runtime, and env failures.
+- `node-bad` — Node metadata, secret, path, runtime, and env failures.
+- `polyglot-mixed` — proportional credit for one good and one incomplete ecosystem.
+- `edge-readme-variants` — alternate README, license, contributor, and template names.
+- `edge-binary-and-large` — binary and over-limit files that must be skipped safely.
+- `edge-symlinks` — links that must not be followed during scanning.
+- `edge-env-usage` — documented and undocumented environment reads.
+- `edge-docker` — version-tagged Docker base image and explicit `CMD`.
+- `edge-non-utf8` — malformed UTF-8 source that remains scan-safe.
+- `config-excludes` — `.repo-ready.toml` path exclusions.
 
-Each repository has an `expected.json` file describing the future detector
-contract:
+The test suite is run with exactly:
 
-```json
-{
-  "score": 100,
-  "ecosystems": ["python"],
-  "checks": {
-    "readme_sections": true,
-    "license": true,
-    "contributing": true,
-    "templates": true,
-    "lockfile": true,
-    "pinned_runtime": true,
-    "dockerfile": true,
-    "test_command": true,
-    "env_example": true,
-    "no_hardcoded_paths": true
-  }
-}
+```sh
+python -m pytest -q
 ```
-
-The score is the sum of the weights for enabled checks:
-
-| Check | Weight |
-| --- | ---: |
-| `readme_sections` | 15 |
-| `license` | 10 |
-| `contributing` | 10 |
-| `templates` | 10 |
-| `lockfile` | 10 |
-| `pinned_runtime` | 10 |
-| `dockerfile` | 10 |
-| `test_command` | 10 |
-| `env_example` | 5 |
-| `no_hardcoded_paths` | 10 |
-
-The ten check keys are fixed across all expectations. Fixture paths in the
-repository contents are relative, so the fixtures can be copied and run from
-any checkout location.

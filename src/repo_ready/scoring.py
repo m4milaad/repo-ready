@@ -1,322 +1,155 @@
-"""Pure, local filesystem checks and readiness scoring."""
+"""Public scan, scoring, and compatibility helpers."""
 
 from __future__ import annotations
 
-import json
-import re
-import tomllib
 from pathlib import Path
 from typing import Callable, Mapping
 
+from . import __version__
+from .checks import CHECK_MESSAGES, CHECK_WEIGHTS, run_checks
+from .context import RepoContext
 from .detector import detect_ecosystems
+from .models import CheckResult, ScanReport
 
 
-# This is the one fixed scoring table.  Its values intentionally add to 100.
-CHECK_WEIGHTS: dict[str, int] = {
-    "readme_sections": 15,
-    "license": 10,
-    "contributing": 10,
-    "templates": 10,
-    "lockfile": 10,
-    "pinned_runtime": 10,
-    "dockerfile": 10,
-    "test_command": 10,
-    "env_example": 5,
-    "no_hardcoded_paths": 10,
-}
-
-Check = Callable[[Path], bool]
+def _grade(score: int, maximum: int) -> str:
+    if maximum <= 0:
+        return "N/A"
+    percentage = score * 100 / maximum
+    if percentage >= 90:
+        return "A"
+    if percentage >= 75:
+        return "B"
+    if percentage >= 60:
+        return "C"
+    if percentage >= 40:
+        return "D"
+    return "F"
 
 
-def _nonempty_file(path: Path) -> bool:
-    try:
-        return path.is_file() and path.stat().st_size > 0
-    except OSError:
-        return False
+def scan(root: str | Path, *, context: RepoContext | None = None) -> ScanReport:
+    """Run the deterministic readiness scan for *root*."""
 
-
-def _first_existing_file(root: Path, names: tuple[str, ...]) -> Path | None:
-    for name in names:
-        candidate = root / name
-        if _nonempty_file(candidate):
-            return candidate
-    return None
-
-
-def _read_text(path: Path) -> str | None:
-    try:
-        return path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
-        return None
-
-
-def _read_json(path: Path) -> object | None:
-    text = _read_text(path)
-    if text is None:
-        return None
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return None
-
-
-def _readme_headings(text: str) -> set[str]:
-    headings: set[str] = set()
-    for line in text.splitlines():
-        match = re.match(r"^#{2,6}\s+(.+?)\s*#*\s*$", line)
-        if match:
-            headings.add(match.group(1).casefold())
-    return headings
-
-
-def readme_sections(root: Path) -> bool:
-    """Check that README documents the core setup, use, and rebuild flow."""
-
-    readme = _first_existing_file(root, ("README.md", "README.rst", "README.txt"))
-    if readme is None:
-        return False
-    text = _read_text(readme)
-    if text is None:
-        return False
-    headings = _readme_headings(text)
-    required = {"requirements", "setup", "run", "test", "deploy / rebuild"}
-    return required.issubset(headings)
-
-
-def license(root: Path) -> bool:
-    """Check for a non-empty conventional license file."""
-
-    return _first_existing_file(
-        root,
-        ("LICENSE", "LICENSE.md", "LICENSE.txt", "COPYING", "COPYING.md"),
-    ) is not None
-
-
-def contributing(root: Path) -> bool:
-    """Check for contributor guidance."""
-
-    return _first_existing_file(
-        root, ("CONTRIBUTING.md", "CONTRIBUTING.rst", "CONTRIBUTING.txt")
-    ) is not None
-
-
-def templates(root: Path) -> bool:
-    """Check for both pull-request and issue contribution templates."""
-
-    pull_request = _first_existing_file(
-        root,
-        (
-            ".github/PULL_REQUEST_TEMPLATE.md",
-            ".github/PULL_REQUEST_TEMPLATE.txt",
-            ".github/pull_request_template.md",
-        ),
+    ctx = context or RepoContext(root)
+    ecosystems = tuple(detect_ecosystems(ctx))
+    checks = run_checks(ctx, ecosystems)
+    score = sum(check.score for check in checks)
+    maximum = sum(check.max_score for check in checks)
+    return ScanReport(
+        tool="repo-ready",
+        version=__version__,
+        path=str(ctx.root),
+        ecosystems=ecosystems,
+        score=score,
+        max_score=maximum,
+        grade=_grade(score, maximum),
+        checks=checks,
     )
-    issue_directory = root / ".github" / "ISSUE_TEMPLATE"
-    if pull_request is None or not issue_directory.is_dir():
-        return False
-    try:
-        return any(
-            candidate.is_file() and candidate.stat().st_size > 0
-            for candidate in issue_directory.iterdir()
-        )
-    except OSError:
-        return False
 
 
-def lockfile(root: Path) -> bool:
-    """Check for a lockfile used by a supported ecosystem."""
+def report(root: str | Path, *, context: RepoContext | None = None) -> dict[str, object]:
+    """Return the stable JSON-compatible report mapping."""
 
-    for name in ("uv.lock", "poetry.lock", "yarn.lock", "pnpm-lock.yaml"):
-        if _nonempty_file(root / name):
-            return True
-
-    requirements_lock = root / "requirements.lock"
-    if _nonempty_file(requirements_lock) and _python_lockfile_is_valid(
-        root, requirements_lock
-    ):
-        return True
-
-    package_lock = _first_existing_file(
-        root, ("package-lock.json", "npm-shrinkwrap.json")
-    )
-    return package_lock is not None and _node_lockfile_is_valid(root, package_lock)
+    return scan(root, context=context).as_dict()
 
 
-def _meaningful_requirement_lines(text: str) -> list[str]:
-    return [
-        line.strip()
-        for line in text.splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    ]
+def build_report(root: str | Path, *, context: RepoContext | None = None) -> ScanReport:
+    """Model-returning spelling for library callers."""
+
+    return scan(root, context=context)
 
 
-def _python_project_has_dependencies(root: Path) -> bool:
-    requirements = _read_text(root / "requirements.txt")
-    if requirements is not None and _meaningful_requirement_lines(requirements):
-        return True
-
-    pyproject = _read_text(root / "pyproject.toml")
-    if pyproject is None:
-        return False
-    try:
-        metadata = tomllib.loads(pyproject).get("project", {})
-    except tomllib.TOMLDecodeError:
-        return False
-    if not isinstance(metadata, dict):
-        return False
-    dependencies = metadata.get("dependencies", [])
-    optional = metadata.get("optional-dependencies", {})
-    return bool(dependencies) or bool(optional)
+scan_repository = scan
 
 
-def _python_lockfile_is_valid(root: Path, path: Path) -> bool:
-    text = _read_text(path)
-    if text is None:
-        return False
-    if _meaningful_requirement_lines(text):
-        return True
-    return not _python_project_has_dependencies(root)
+def evaluate_rules(root: str | Path) -> tuple[CheckResult, ...]:
+    """Evaluate the new RR rules in ID order."""
+
+    return scan(root).checks
 
 
-def _node_lockfile_is_valid(root: Path, path: Path) -> bool:
-    lock = _read_json(path)
-    if not isinstance(lock, dict):
-        return False
-    package = _read_json(root / "package.json")
-    if not isinstance(package, dict):
-        return True
-    dependency_groups = (
-        package.get("dependencies", {}),
-        package.get("devDependencies", {}),
-        package.get("optionalDependencies", {}),
-    )
-    declared = {
-        name
-        for group in dependency_groups
-        if isinstance(group, dict)
-        for name in group
+def score_checks(checks: Mapping[str, object]) -> int:
+    """Score either new check models or the old boolean mapping API."""
+
+    total = 0
+    legacy_weights = {
+        "readme_sections": 15,
+        "license": 10,
+        "contributing": 10,
+        "templates": 10,
+        "lockfile": 10,
+        "pinned_runtime": 10,
+        "dockerfile": 10,
+        "test_command": 10,
+        "env_example": 5,
+        "no_hardcoded_paths": 10,
     }
-    if not declared:
-        return True
-    packages = lock.get("packages", {})
-    if isinstance(packages, dict):
-        installed = {
-            str(package_name).removeprefix("node_modules/")
-            for package_name in packages
-            if str(package_name).startswith("node_modules/")
-        }
-        if declared.issubset(installed):
-            return True
-    dependencies = lock.get("dependencies", {})
-    return isinstance(dependencies, dict) and declared.issubset(dependencies)
+    for rule_id, weight in CHECK_WEIGHTS.items():
+        value = checks.get(rule_id)
+        if isinstance(value, CheckResult):
+            total += value.score
+        elif isinstance(value, bool) and value:
+            total += weight
+        elif isinstance(value, (int, float)) and value:
+            total += min(weight, max(0, int(value)))
+    if any(name in checks for name in legacy_weights):
+        return sum(weight for name, weight in legacy_weights.items() if checks.get(name) is True)
+    return total
 
 
-def pinned_runtime(root: Path) -> bool:
-    """Check for a supported runtime-version file."""
-
-    python_version = _read_text(root / ".python-version")
-    if python_version is not None and re.fullmatch(
-        r"\s*\d+\.\d+(?:\.\d+)?\s*", python_version
-    ):
-        return True
-    node_version = _read_text(root / ".nvmrc")
-    return node_version is not None and bool(
-        re.fullmatch(r"\s*v?\d+(?:\.\d+){0,2}\s*", node_version)
-    )
+# ---------------------------------------------------------------------------
+# Compatibility entry points from the initial ten-check public module.
+# They remain pure functions and now use the shared indexed context.
 
 
-def dockerfile(root: Path) -> bool:
-    """Check for a usable Dockerfile with a base image declaration."""
-
-    path = _first_existing_file(root, ("Dockerfile", "dockerfile"))
-    if path is None:
-        return False
-    text = _read_text(path)
-    return text is not None and bool(re.search(r"(?m)^\s*FROM\s+\S+", text))
+def _legacy(root: str | Path, rule_id: str) -> bool:
+    return next(check for check in scan(root).checks if check.id == rule_id).status == "pass"
 
 
-def _makefile_has_test_target(text: str) -> bool:
-    return bool(re.search(r"(?m)^\s*(?:[A-Za-z0-9_.-]+\s*:\s*[^\n]*\s*)?test\s*:", text))
+def readme_sections(root: str | Path) -> bool:
+    return _legacy(root, "RR01")
 
 
-def test_command(root: Path) -> bool:
-    """Check for a declared test command in common project entry points."""
-
-    makefile = _first_existing_file(root, ("Makefile", "makefile", "GNUmakefile"))
-    if makefile is not None:
-        text = _read_text(makefile)
-        if text is not None and _makefile_has_test_target(text):
-            return True
-
-    package = _read_json(root / "package.json")
-    if isinstance(package, dict):
-        scripts = package.get("scripts")
-        if isinstance(scripts, dict) and isinstance(scripts.get("test"), str):
-            return bool(scripts["test"].strip())
-
-    pyproject = _read_text(root / "pyproject.toml")
-    if pyproject is not None and re.search(
-        r"(?im)^\s*test\s*=\s*[\"'](?:[^\"']+)\s*[\"']", pyproject
-    ):
-        return True
-    return False
+def license(root: str | Path) -> bool:
+    return _legacy(root, "RR02")
 
 
-def env_example(root: Path) -> bool:
-    """Check for a non-empty example environment file."""
-
-    return _nonempty_file(root / ".env.example")
+def contributing(root: str | Path) -> bool:
+    return _legacy(root, "RR03")
 
 
-_ABSOLUTE_PATH_PATTERNS = (
-    re.compile(r"(?<![A-Za-z0-9_])/(?:Users|home|root|private/var|opt|tmp)/"),
-    re.compile(r"(?i)(?<![A-Za-z0-9_])[A-Z]:[\\/]Users[\\/]"),
-    re.compile(r"(?i)(?<![A-Za-z0-9_])[A-Z]:[\\/](?:Windows|Program Files)[\\/]"),
-    re.compile(r"(?<![A-Za-z0-9_])\\\\(?:Users|home|root)\\\\"),
-)
-_SKIPPED_DIRECTORIES = {
-    ".git",
-    ".hg",
-    ".svn",
-    ".venv",
-    "venv",
-    "node_modules",
-    "__pycache__",
-    ".pytest_cache",
-}
+def templates(root: str | Path) -> bool:
+    return _legacy(root, "RR04")
 
 
-def _iter_text_files(root: Path):
-    try:
-        paths = root.rglob("*")
-    except (OSError, ValueError):
-        return
-    for path in paths:
-        if not path.is_file() or any(part in _SKIPPED_DIRECTORIES for part in path.parts):
-            continue
-        try:
-            if path.stat().st_size > 1_000_000:
-                continue
-            data = path.read_bytes()
-        except OSError:
-            continue
-        if b"\x00" in data:
-            continue
-        try:
-            yield path, data.decode("utf-8")
-        except UnicodeDecodeError:
-            continue
+def lockfile(root: str | Path) -> bool:
+    return _legacy(root, "RR06")
 
 
-def no_hardcoded_paths(root: Path) -> bool:
-    """Check that repository text does not contain common machine paths."""
-
-    for _path, text in _iter_text_files(root):
-        if any(pattern.search(text) for pattern in _ABSOLUTE_PATH_PATTERNS):
-            return False
-    return True
+def pinned_runtime(root: str | Path) -> bool:
+    return _legacy(root, "RR07")
 
 
+def dockerfile(root: str | Path) -> bool:
+    return _legacy(root, "RR08")
+
+
+def test_command(root: str | Path) -> bool:
+    return _legacy(root, "RR09")
+
+
+def env_example(root: str | Path) -> bool:
+    return _legacy(root, "RR10")
+
+
+def no_hardcoded_paths(root: str | Path) -> bool:
+    return _legacy(root, "RR12")
+
+
+# Names retained for callers of the original scoring module. New consumers
+# should use ``CHECK_WEIGHTS`` and the RR models; this mapping still offers the
+# original boolean-callable surface without bypassing RepoContext.
+Check = Callable[[Path], bool]
 CHECKS: dict[str, Check] = {
     "readme_sections": readme_sections,
     "license": license,
@@ -331,24 +164,36 @@ CHECKS: dict[str, Check] = {
 }
 
 
-def evaluate_checks(root: Path) -> dict[str, bool]:
-    """Evaluate all checks in the fixed contract order."""
-
+def evaluate_legacy_checks(root: str | Path) -> dict[str, bool]:
     return {name: check(root) for name, check in CHECKS.items()}
 
 
-def score_checks(checks: Mapping[str, bool]) -> int:
-    """Return the weighted score for a check result mapping."""
+def evaluate_checks(root: str | Path) -> dict[str, bool]:
+    """Backward-compatible boolean evaluation entry point."""
 
-    return sum(weight for name, weight in CHECK_WEIGHTS.items() if checks.get(name, False))
+    return evaluate_legacy_checks(root)
 
 
-def report(root: Path) -> dict[str, object]:
-    """Build the exact machine-readable check report."""
-
-    checks = evaluate_checks(root)
-    return {
-        "score": score_checks(checks),
-        "ecosystems": detect_ecosystems(root),
-        "checks": checks,
-    }
+__all__ = [
+    "CHECK_MESSAGES",
+    "CHECKS",
+    "CHECK_WEIGHTS",
+    "build_report",
+    "contributing",
+    "dockerfile",
+    "env_example",
+    "evaluate_checks",
+    "evaluate_legacy_checks",
+    "evaluate_rules",
+    "license",
+    "lockfile",
+    "no_hardcoded_paths",
+    "pinned_runtime",
+    "readme_sections",
+    "report",
+    "scan",
+    "scan_repository",
+    "score_checks",
+    "templates",
+    "test_command",
+]

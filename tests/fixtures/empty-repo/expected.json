@@ -1,0 +1,163 @@
+{
+  "tool": "repo-ready",
+  "version": "0.1.0",
+  "path": "<REPO>",
+  "ecosystems": [],
+  "score": 12,
+  "max": 48,
+  "grade": "F",
+  "checks": [
+    {
+      "id": "RR01",
+      "message": "README documents requirements, setup, run, test, and rebuild.",
+      "weight": 14,
+      "status": "fail",
+      "score": 0,
+      "max": 14,
+      "findings": [
+        {
+          "file": "README.md",
+          "line": null,
+          "detail": "README file is missing."
+        }
+      ]
+    },
+    {
+      "id": "RR02",
+      "message": "A license file is present.",
+      "weight": 6,
+      "status": "fail",
+      "score": 0,
+      "max": 6,
+      "findings": [
+        {
+          "file": "LICENSE",
+          "line": null,
+          "detail": "A non-empty license file is missing."
+        }
+      ]
+    },
+    {
+      "id": "RR03",
+      "message": "Contributor guidance is present.",
+      "weight": 6,
+      "status": "fail",
+      "score": 0,
+      "max": 6,
+      "findings": [
+        {
+          "file": "CONTRIBUTING.md",
+          "line": null,
+          "detail": "Contributor guidance is missing."
+        }
+      ]
+    },
+    {
+      "id": "RR04",
+      "message": "Pull-request and issue templates are present.",
+      "weight": 4,
+      "status": "fail",
+      "score": 0,
+      "max": 4,
+      "findings": [
+        {
+          "file": ".github/ISSUE_TEMPLATE",
+          "line": null,
+          "detail": "Issue template is missing."
+        },
+        {
+          "file": ".github/PULL_REQUEST_TEMPLATE.md",
+          "line": null,
+          "detail": "Pull-request template is missing."
+        }
+      ]
+    },
+    {
+      "id": "RR05",
+      "message": "Supported ecosystem metadata is valid and identifiable.",
+      "weight": 4,
+      "status": "na",
+      "score": 0,
+      "max": 0,
+      "findings": []
+    },
+    {
+      "id": "RR06",
+      "message": "Declared dependencies have a usable lockfile.",
+      "weight": 10,
+      "status": "na",
+      "score": 0,
+      "max": 0,
+      "findings": []
+    },
+    {
+      "id": "RR07",
+      "message": "Supported runtimes are pinned.",
+      "weight": 8,
+      "status": "na",
+      "score": 0,
+      "max": 0,
+      "findings": []
+    },
+    {
+      "id": "RR08",
+      "message": "A rebuildable Dockerfile is present.",
+      "weight": 12,
+      "status": "na",
+      "score": 0,
+      "max": 0,
+      "findings": []
+    },
+    {
+      "id": "RR09",
+      "message": "A deterministic test command is documented.",
+      "weight": 12,
+      "status": "na",
+      "score": 0,
+      "max": 0,
+      "findings": []
+    },
+    {
+      "id": "RR10",
+      "message": "An example environment file documents configuration keys.",
+      "weight": 6,
+      "status": "fail",
+      "score": 0,
+      "max": 6,
+      "findings": [
+        {
+          "file": ".env.example",
+          "line": null,
+          "detail": "Example environment file is missing."
+        }
+      ]
+    },
+    {
+      "id": "RR11",
+      "message": "No likely hard-coded secrets are committed.",
+      "weight": 8,
+      "status": "pass",
+      "score": 8,
+      "max": 8,
+      "findings": []
+    },
+    {
+      "id": "RR12",
+      "message": "No machine-specific absolute paths are committed.",
+      "weight": 4,
+      "status": "pass",
+      "score": 4,
+      "max": 4,
+      "findings": []
+    },
+    {
+      "id": "RR13",
+      "message": "Environment reads are represented in the example configuration.",
+      "weight": 6,
+      "status": "na",
+      "score": 0,
+      "max": 0,
+      "findings": []
+    }
+  ]
+}

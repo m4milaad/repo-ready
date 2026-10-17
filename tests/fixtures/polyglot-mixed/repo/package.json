@@ -1,0 +1,4 @@
+{
+  "name": "polyglot-mixed-node",
+  "dependencies": {"fixture-lib": "1.0.0"}
+}

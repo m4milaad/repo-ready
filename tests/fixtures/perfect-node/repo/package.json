@@ -1,0 +1,7 @@
+{
+  "name": "perfect-node",
+  "version": "1.0.0",
+  "engines": {"node": "20.11.1"},
+  "scripts": {"test": "node --test"},
+  "dependencies": {"fixture-lib": "1.0.0"}
+}

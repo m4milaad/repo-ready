@@ -1,0 +1,1 @@
+# intentionally malformed utf8 ÿþ\nprint("ready")\n

@@ -1,0 +1,4 @@
+{
+  "name": "node-bad",
+  "dependencies": {"fixture-lib": "1.0.0"}
+}

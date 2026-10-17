@@ -35,12 +35,17 @@ def _resolve_repository(path: Path) -> Path | None:
 
 def _print_human_report(repository: Path, result: dict[str, object]) -> None:
     print(f"Repository: {repository}")
-    print(f"Score: {result['score']}/100")
+    print(f"Score: {result['score']}/{result.get('max', 100)} (grade {result.get('grade', 'N/A')})")
     ecosystems = result["ecosystems"]
     print(f"Ecosystems: {', '.join(ecosystems) if ecosystems else 'none'}")
     checks = result["checks"]
-    for name, passed in checks.items():
-        print(f"  {'PASS' if passed else 'FAIL'} {name}")
+    if isinstance(checks, list):
+        for check in checks:
+            if isinstance(check, dict):
+                print(f"  {str(check.get('status', '')).upper():<7} {check.get('id', '')} {check.get('message', '')}")
+    else:
+        for name, passed in checks.items():
+            print(f"  {'PASS' if passed else 'FAIL'} {name}")
 
 
 def _run_check(repository: Path, as_json: bool) -> int:

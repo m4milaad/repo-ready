@@ -1,0 +1,5 @@
+[project]
+name = "perfect-python"
+version = "1.0.0"
+requires-python = ">=3.12"
+dependencies = ["fixture-lib==1.0.0"]

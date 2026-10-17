@@ -10,13 +10,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from .context import RepoContext
+
 
 class EcosystemDetector(Protocol):
     """The common interface implemented by all ecosystem detectors."""
 
     name: str
 
-    def detect(self, root: Path) -> bool:
+    def detect(self, root: Path | RepoContext) -> bool:
         """Return whether *root* contains a marker for this ecosystem."""
 
 
@@ -27,10 +29,11 @@ class MarkerFileDetector:
     name: str
     marker_files: tuple[str, ...]
 
-    def detect(self, root: Path) -> bool:
-        return any((root / marker).is_file() for marker in self.marker_files)
+    def detect(self, root: Path | RepoContext) -> bool:
+        context = root if isinstance(root, RepoContext) else RepoContext(root)
+        return any(context.has_file(marker) for marker in self.marker_files)
 
-    def detects(self, root: Path) -> bool:
+    def detects(self, root: Path | RepoContext) -> bool:
         """Backward-compatible spelling for the detector operation."""
 
         return self.detect(root)
@@ -40,23 +43,39 @@ class MarkerFileDetector:
 ECOSYSTEM_DETECTORS: tuple[EcosystemDetector, ...] = (
     MarkerFileDetector(
         "python",
-        ("pyproject.toml", "requirements.txt", "uv.lock", "poetry.lock"),
+        (
+            "pyproject.toml",
+            "requirements.txt",
+            "requirements.lock",
+            "setup.py",
+            "setup.cfg",
+            "Pipfile",
+            "uv.lock",
+            "poetry.lock",
+        ),
     ),
     MarkerFileDetector(
         "node",
-        ("package.json", "package-lock.json", ".nvmrc"),
+        (
+            "package.json",
+            "package-lock.json",
+            "npm-shrinkwrap.json",
+            "yarn.lock",
+            "pnpm-lock.yaml",
+            ".nvmrc",
+        ),
     ),
 )
 
 
-def detect_ecosystems(root: Path) -> list[str]:
+def detect_ecosystems(root: Path | RepoContext) -> list[str]:
     """Return detected ecosystem names in stable priority order."""
 
-    root = Path(root)
-    return [detector.name for detector in ECOSYSTEM_DETECTORS if detector.detect(root)]
+    context = root if isinstance(root, RepoContext) else RepoContext(root)
+    return [detector.name for detector in ECOSYSTEM_DETECTORS if detector.detect(context)]
 
 
-def detect(root: Path) -> list[str]:
+def detect(root: Path | RepoContext) -> list[str]:
     """Compatibility alias for callers that prefer a shorter API name."""
 
     return detect_ecosystems(root)
