@@ -7,6 +7,8 @@ the clock.  They consume one immutable :class:`RepoContext` file index.
 from __future__ import annotations
 
 import json
+import ast
+import configparser
 import re
 import tomllib
 from dataclasses import dataclass
@@ -203,9 +205,27 @@ def rr04(ctx: RepoContext) -> CheckResult:
     return _result("RR04", 4 if issue else 0, () if issue else [_finding(".github/ISSUE_TEMPLATE", "No issue template file is present.")])
 
 
-def rr05(ctx: RepoContext) -> CheckResult:
-    path = _nonempty(ctx, (".github/PULL_REQUEST_TEMPLATE.md", "PULL_REQUEST_TEMPLATE.md", "docs/PULL_REQUEST_TEMPLATE.md"))
-    return _result("RR05", 4 if path else 0, () if path else [_finding(".github/PULL_REQUEST_TEMPLATE.md", "No pull-request template is present.")])
+_PYTHON_METADATA_FILES = ("pyproject.toml", "setup.cfg", "setup.py", "Pipfile")
+_REQUIREMENTS_FILE = re.compile(r"requirements(?:-[^/]+)?\.txt")
+_DEPENDENCY_GROUPS = (
+    "dependencies",
+    "devDependencies",
+    "optionalDependencies",
+    "peerDependencies",
+)
+
+
+def _manifest_text(ctx: RepoContext, path: str) -> tuple[str | None, str | None]:
+    """Return a manifest's text and a deterministic read error, if any."""
+
+    if not ctx.has_file(path):
+        return None, f"{path} is missing."
+    text = ctx.read_text(path)
+    if text is None:
+        return None, f"{path} is unreadable or is not a supported text file."
+    if not text.strip():
+        return None, f"{path} is empty."
+    return text, None
 
 
 def _json(ctx: RepoContext, path: str) -> dict[str, object] | None:
@@ -230,95 +250,530 @@ def _toml(ctx: RepoContext, path: str) -> dict[str, object] | None:
     return value if isinstance(value, dict) else None
 
 
+def _nonempty_string(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _string_list(value: object) -> bool:
+    return isinstance(value, list) and all(_nonempty_string(item) for item in value)
+
+
+def _valid_python_toml(value: dict[str, object], path: str) -> list[str]:
+    findings: list[str] = []
+    if path == "Pipfile":
+        known_sections = ("packages", "dev-packages", "requires", "source", "scripts")
+        if not any(section in value for section in known_sections):
+            findings.append("Pipfile must contain a packages, dev-packages, requires, source, or scripts table.")
+        for section in ("packages", "dev-packages"):
+            if section in value and not isinstance(value[section], dict):
+                findings.append(f"Pipfile [{section}] must be a table.")
+        if "source" in value and not isinstance(value["source"], list):
+            findings.append("Pipfile [[source]] must be an array of tables.")
+        if "requires" in value and not isinstance(value["requires"], dict):
+            findings.append("Pipfile [requires] must be a table.")
+        return findings
+
+    project = value.get("project")
+    if not isinstance(project, dict):
+        tool = value.get("tool")
+        poetry = tool.get("poetry") if isinstance(tool, dict) else None
+        if isinstance(poetry, dict):
+            if not _nonempty_string(poetry.get("name")):
+                findings.append("pyproject.toml [tool.poetry] needs a non-empty name.")
+            if not _nonempty_string(poetry.get("version")):
+                findings.append("pyproject.toml [tool.poetry] needs a non-empty version.")
+            return findings
+        findings.append("pyproject.toml must contain a [project] table with package metadata.")
+        return findings
+
+    if not _nonempty_string(project.get("name")):
+        findings.append("pyproject.toml [project] needs a non-empty name.")
+    dynamic = project.get("dynamic", [])
+    if dynamic and (not _string_list(dynamic) or "version" not in dynamic):
+        findings.append("pyproject.toml [project].dynamic must be a string list containing version when version is omitted.")
+    if not _nonempty_string(project.get("version")) and "version" not in dynamic:
+        findings.append("pyproject.toml [project] needs a non-empty version or dynamic = [\"version\"].")
+    if "dependencies" in project and not _string_list(project["dependencies"]):
+        findings.append("pyproject.toml [project].dependencies must be a list of requirement strings.")
+    optional = project.get("optional-dependencies")
+    if optional is not None:
+        if not isinstance(optional, dict) or not all(_string_list(item) for item in optional.values()):
+            findings.append("pyproject.toml [project].optional-dependencies must map names to requirement lists.")
+    if "requires-python" in project and not _nonempty_string(project["requires-python"]):
+        findings.append("pyproject.toml [project].requires-python must be a non-empty string.")
+    build_system = value.get("build-system")
+    if build_system is not None:
+        if not isinstance(build_system, dict):
+            findings.append("pyproject.toml [build-system] must be a table.")
+        else:
+            if "requires" in build_system and not _string_list(build_system["requires"]):
+                findings.append("pyproject.toml [build-system].requires must be a list of strings.")
+            if "build-backend" in build_system and not _nonempty_string(build_system["build-backend"]):
+                findings.append("pyproject.toml [build-system].build-backend must be a non-empty string.")
+    return findings
+
+
+_MISSING = object()
+
+
+def _static_ast_value(node: ast.AST, constants: dict[str, object]) -> object:
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.Name):
+        return constants.get(node.id, _MISSING)
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        values = [_static_ast_value(item, constants) for item in node.elts]
+        return _MISSING if any(item is _MISSING for item in values) else values
+    if isinstance(node, ast.Dict):
+        result: dict[object, object] = {}
+        for key, value in zip(node.keys, node.values):
+            if key is None:
+                return _MISSING
+            static_key = _static_ast_value(key, constants)
+            static_value = _static_ast_value(value, constants)
+            if static_key is _MISSING or static_value is _MISSING:
+                return _MISSING
+            try:
+                result[static_key] = static_value
+            except TypeError:
+                return _MISSING
+        return result
+    return _MISSING
+
+
+def _setup_call(text: str) -> tuple[ast.Call, dict[str, object]] | None:
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return None
+    setup_names = {"setup"}
+    constants: dict[str, object] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module in {"setuptools", "distutils.core"}:
+            for alias in node.names:
+                if alias.name == "setup":
+                    setup_names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Assign):
+            value = _static_ast_value(node.value, constants)
+            if value is not _MISSING:
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        constants[target.id] = value
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name) and node.func.id in setup_names:
+            return node, constants
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "setup":
+            return node, constants
+    return None
+
+
+def _valid_setup_cfg(text: str) -> list[str]:
+    parser = configparser.RawConfigParser(interpolation=None, strict=True)
+    try:
+        parser.read_string(text)
+    except configparser.Error as error:
+        return [f"setup.cfg is not valid INI configuration: {error.__class__.__name__}."]
+    if not parser.has_section("metadata"):
+        return ["setup.cfg must contain a [metadata] section with a name."]
+    findings: list[str] = []
+    if not _nonempty_string(parser.get("metadata", "name", fallback=None)):
+        findings.append("setup.cfg [metadata] needs a non-empty name.")
+    if "version" in parser["metadata"] and not _nonempty_string(parser.get("metadata", "version")):
+        findings.append("setup.cfg [metadata].version must be a non-empty value.")
+    if parser.has_section("options") and "install_requires" in parser["options"]:
+        if not parser.get("options", "install_requires").strip():
+            findings.append("setup.cfg [options].install_requires cannot be empty when declared.")
+    return findings
+
+
+def _valid_setup_py(text: str) -> list[str]:
+    call_data = _setup_call(text)
+    if call_data is None:
+        try:
+            ast.parse(text)
+        except SyntaxError as error:
+            return [f"setup.py has invalid Python syntax at line {error.lineno or 1}."]
+        return ["setup.py must contain a statically inspectable setup() call."]
+    call, constants = call_data
+    keywords = {keyword.arg: keyword.value for keyword in call.keywords if keyword.arg is not None}
+    findings: list[str] = []
+    name = _static_ast_value(keywords["name"], constants) if "name" in keywords else _MISSING
+    version = _static_ast_value(keywords["version"], constants) if "version" in keywords else _MISSING
+    if not _nonempty_string(name):
+        findings.append("setup.py setup() needs a statically declared non-empty name= value.")
+    if not _nonempty_string(version):
+        findings.append("setup.py setup() needs a statically declared non-empty version= value.")
+    for key in ("install_requires", "extras_require"):
+        if key in keywords and _static_ast_value(keywords[key], constants) is _MISSING:
+            findings.append(f"setup.py setup() {key}= must be a static list or mapping for filesystem-only validation.")
+    return findings
+
+
+def _valid_package_json(value: dict[str, object]) -> list[str]:
+    findings: list[str] = []
+    if not _nonempty_string(value.get("name")):
+        findings.append("package.json needs a non-empty string name.")
+    if "version" in value and not _nonempty_string(value["version"]):
+        findings.append("package.json version must be a non-empty string when present.")
+    for group in _DEPENDENCY_GROUPS:
+        if group in value:
+            dependencies = value[group]
+            if not isinstance(dependencies, dict):
+                findings.append(f"package.json {group} must be an object of package names to specifiers.")
+            elif any(not isinstance(name, str) or not name.strip() or not isinstance(specifier, str) or not specifier.strip() for name, specifier in dependencies.items()):
+                findings.append(f"package.json {group} must contain non-empty string names and specifiers.")
+    for field in ("scripts", "engines"):
+        if field in value:
+            section = value[field]
+            if not isinstance(section, dict) or any(not isinstance(key, str) or not isinstance(item, str) for key, item in section.items()):
+                findings.append(f"package.json {field} must be an object of string values.")
+    for field in ("files", "bundledDependencies", "bundleDependencies"):
+        if field in value and (not isinstance(value[field], list) or any(not _nonempty_string(item) for item in value[field])):
+            findings.append(f"package.json {field} must be a list of non-empty strings.")
+    if "private" in value and not isinstance(value["private"], bool):
+        findings.append("package.json private must be a boolean when present.")
+    return findings
+
+
+def _manifest_findings(ctx: RepoContext, path: str) -> list[Finding]:
+    text, error = _manifest_text(ctx, path)
+    if error:
+        return [_finding(path, error)]
+    assert text is not None
+    if path == "package.json":
+        value = _json(ctx, path)
+        if value is None:
+            return [_finding(path, "package.json must contain a valid JSON object.")]
+        return [_finding(path, detail) for detail in _valid_package_json(value)]
+    if path == "setup.py":
+        return [_finding(path, detail) for detail in _valid_setup_py(text)]
+    if path == "setup.cfg":
+        return [_finding(path, detail) for detail in _valid_setup_cfg(text)]
+    value = _toml(ctx, path)
+    if value is None:
+        return [_finding(path, f"{path} must contain valid TOML.")]
+    return [_finding(path, detail) for detail in _valid_python_toml(value, path)]
+
+
+def _python_metadata_paths(ctx: RepoContext) -> tuple[str, ...]:
+    return tuple(path for path in _PYTHON_METADATA_FILES if ctx.has_file(path))
+
+
+def _python_marker_present(ctx: RepoContext) -> bool:
+    return bool(_python_metadata_paths(ctx) or any(_REQUIREMENTS_FILE.fullmatch(entry.path) for entry in ctx))
+
+
 def _python_manifest(ctx: RepoContext) -> bool:
-    if ctx.has_file("pyproject.toml"):
-        value = _toml(ctx, "pyproject.toml")
-        project = value.get("project") if value else None
-        return isinstance(project, dict) and bool(project.get("name"))
-    if ctx.has_file("setup.cfg"):
-        return _toml(ctx, "setup.cfg") is not None or ctx.read_text("setup.cfg") is not None
-    if ctx.has_file("setup.py"):
-        text = ctx.read_text("setup.py")
-        return text is not None and bool(re.search(r"\bsetup\s*\(", text))
-    if ctx.has_file("Pipfile"):
-        return _toml(ctx, "Pipfile") is not None
-    return False
+    paths = _python_metadata_paths(ctx)
+    return bool(paths) and not any(_manifest_findings(ctx, path) for path in paths)
 
 
 def _node_manifest(ctx: RepoContext) -> bool:
-    value = _json(ctx, "package.json")
-    return value is not None and isinstance(value.get("name"), str) and bool(value.get("name"))
+    return ctx.has_file("package.json") and not _manifest_findings(ctx, "package.json")
+
+
+def rr05(ctx: RepoContext) -> CheckResult:
+    """Check for a pull-request template at one of the supported paths."""
+
+    path = _nonempty(
+        ctx,
+        (
+            ".github/PULL_REQUEST_TEMPLATE.md",
+            "PULL_REQUEST_TEMPLATE.md",
+            "docs/PULL_REQUEST_TEMPLATE.md",
+        ),
+    )
+    return _result(
+        "RR05",
+        4 if path else 0,
+        () if path else [_finding(".github/PULL_REQUEST_TEMPLATE.md", "No pull-request template is present.")],
+    )
 
 
 def _dependencies(ctx: RepoContext, ecosystem: str) -> bool:
     if ecosystem == "python":
-        requirements = sorted(
-            entry.path
-            for entry in ctx
-            if re.fullmatch(r"requirements(?:-[^/]+)?\.txt", entry.path)
-        )
-        if any(
-            line.strip() and not line.lstrip().startswith(("#", "-"))
-            for path in requirements
-            for line in (ctx.read_text(path) or "").splitlines()
-        ):
+        requirements = sorted(entry.path for entry in ctx if _REQUIREMENTS_FILE.fullmatch(entry.path))
+        for path in requirements:
+            text = ctx.read_text(path)
+            if _requirements_have_dependencies(text):
+                return True
+        value = _toml(ctx, "pyproject.toml") if ctx.has_file("pyproject.toml") else None
+        if ctx.has_file("pyproject.toml") and value is None:
             return True
-        value = _toml(ctx, "pyproject.toml")
         project = value.get("project") if value else None
         if isinstance(project, dict) and (project.get("dependencies") or project.get("optional-dependencies")):
             return True
-        pipfile = _toml(ctx, "Pipfile")
-        return isinstance(pipfile, dict) and any(isinstance(pipfile.get(name), dict) and pipfile[name] for name in ("packages", "dev-packages"))
-    package = _json(ctx, "package.json") or {}
-    return any(isinstance(package.get(name), dict) and package[name] for name in ("dependencies", "devDependencies", "optionalDependencies"))
+        tool = value.get("tool") if value else None
+        poetry = tool.get("poetry") if isinstance(tool, dict) else None
+        if isinstance(poetry, dict):
+            for section in ("dependencies", "dev-dependencies"):
+                values = poetry.get(section)
+                if isinstance(values, dict) and any(str(name).casefold() != "python" for name in values):
+                    return True
+        if ctx.has_file("setup.cfg"):
+            parser = _setup_cfg_parser(ctx.read_text("setup.cfg"))
+            if parser is None:
+                return True
+            if parser.has_section("options") and parser.get("options", "install_requires", fallback="").strip():
+                return True
+            if parser.has_section("options.extras_require") and parser.items("options.extras_require"):
+                return True
+        if ctx.has_file("setup.py"):
+            known, names = _setup_dependency_names(ctx.read_text("setup.py"))
+            if not known or names:
+                return True
+        pipfile = _toml(ctx, "Pipfile") if ctx.has_file("Pipfile") else None
+        if ctx.has_file("Pipfile") and pipfile is None:
+            return True
+        return isinstance(pipfile, dict) and any(
+            isinstance(pipfile.get(name), dict) and bool(pipfile[name])
+            for name in ("packages", "dev-packages")
+        )
+    package = _json(ctx, "package.json") if ctx.has_file("package.json") else None
+    if ctx.has_file("package.json") and package is None:
+        return True
+    if not isinstance(package, dict):
+        return False
+    for name in (*_DEPENDENCY_GROUPS, "bundledDependencies", "bundleDependencies"):
+        if name not in package:
+            continue
+        value = package[name]
+        if isinstance(value, dict):
+            if value:
+                return True
+        elif isinstance(value, list):
+            if value:
+                return True
+        elif value is not None:
+            return True
+    return False
+
+
+def _setup_cfg_parser(text: str | None) -> configparser.RawConfigParser | None:
+    if text is None:
+        return None
+    parser = configparser.RawConfigParser(interpolation=None, strict=True)
+    try:
+        parser.read_string(text)
+    except configparser.Error:
+        return None
+    return parser
+
+
+_REQUIREMENT_NAME = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9_.-]*)")
+
+
+def _dependency_name(value: str) -> str | None:
+    match = _REQUIREMENT_NAME.match(value)
+    return match.group(1).casefold() if match else None
+
+
+def _setup_dependency_names(text: str | None) -> tuple[bool, set[str]]:
+    if text is None:
+        return False, set()
+    call_data = _setup_call(text)
+    if call_data is None:
+        return False, set()
+    call, constants = call_data
+    keywords = {keyword.arg: keyword.value for keyword in call.keywords if keyword.arg is not None}
+    names: set[str] = set()
+    for key in ("install_requires", "extras_require"):
+        if key not in keywords:
+            continue
+        value = _static_ast_value(keywords[key], constants)
+        if isinstance(value, dict):
+            values = [item for group in value.values() if isinstance(group, list) for item in group]
+        elif isinstance(value, list):
+            values = value
+        else:
+            return False, set()
+        for item in values:
+            if isinstance(item, str) and (name := _dependency_name(item)):
+                names.add(name)
+    return True, names
+
+
+def _requirement_entries(text: str | None) -> list[str]:
+    if text is None:
+        return []
+    return [line.strip() for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+
+
+def _requirements_have_dependencies(text: str | None) -> bool:
+    allowed_options = (
+        "--hash=", "--index-url", "--extra-index-url", "--trusted-host",
+        "--find-links", "--no-index", "--require-hashes",
+    )
+    return any(not line.startswith(allowed_options) for line in _requirement_entries(text))
 
 
 def _requirements_locked(ctx: RepoContext) -> bool:
-    paths = sorted(entry.path for entry in ctx if re.fullmatch(r"requirements(?:-[^/]+)?\.txt", entry.path))
+    paths = sorted(entry.path for entry in ctx if _REQUIREMENTS_FILE.fullmatch(entry.path))
     if not paths:
         return False
     for path in paths:
-        text = ctx.read_text(path)
-        if text is None:
-            return False
-        lines = [line.strip() for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
-        if any(line.startswith(('-r', '-e', '--')) or "==" not in line for line in lines):
+        if not _valid_requirements_lock(ctx.read_text(path)):
             return False
     return True
 
 
-def _lock_ok(ctx: RepoContext, ecosystem: str) -> bool | None:
-    if not _dependencies(ctx, ecosystem):
-        return None
+def _valid_requirements_lock(text: str | None) -> bool:
+    entries = _requirement_entries(text)
+    if not entries:
+        return False
+    dependencies = 0
+    allowed_options = (
+        "--hash=", "--index-url", "--extra-index-url", "--trusted-host",
+        "--find-links", "--no-index", "--require-hashes",
+    )
+    for line in entries:
+        logical = line.rstrip("\\").strip()
+        if logical.startswith(allowed_options):
+            continue
+        if logical.startswith(("-r", "--requirement", "-c", "--constraint", "-e", "--editable")):
+            return False
+        if logical.startswith("-"):
+            return False
+        requirement_text, _, _marker = logical.partition(";")
+        parts = requirement_text.split()
+        requirement = parts[0] if parts else ""
+        if any(not part.startswith("--hash=") for part in parts[1:]):
+            return False
+        if not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9_.-]*(?:\[[^\]]+\])?\s*==\s*(?![=\s])[^\s;#\\]+",
+            requirement,
+        ):
+            return False
+        dependencies += 1
+    return dependencies > 0
+
+
+def _lock_paths(ctx: RepoContext, ecosystem: str) -> tuple[str, ...]:
     if ecosystem == "python":
-        if _requirements_locked(ctx):
-            return True
+        requirements = sorted(entry.path for entry in ctx if _REQUIREMENTS_FILE.fullmatch(entry.path))
         for name in ("uv.lock", "poetry.lock", "Pipfile.lock", "pdm.lock"):
-            if _nonempty(ctx, (name,)):
-                if name == "Pipfile.lock" and not _valid_pipfile_lock(ctx, name):
-                    continue
-                return True
-        return False
-    package = _json(ctx, "package.json") or {}
-    declared = {name for group in ("dependencies", "devDependencies", "optionalDependencies") if isinstance(package.get(group), dict) for name in package[group]}
-    path = _nonempty(ctx, ("package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml"))
-    if path is None:
-        return False
-    if path in {"package-lock.json", "npm-shrinkwrap.json"}:
-        lock = _json(ctx, path)
-        if not _valid_node_lock(lock):
-            return False
-        if not declared:
-            return True
-        packages = lock.get("packages")
-        installed = {str(name).removeprefix("node_modules/") for name in packages if str(name).startswith("node_modules/")} if isinstance(packages, dict) else set()
-        dependencies = lock.get("dependencies")
-        return declared.issubset(installed) or (isinstance(dependencies, dict) and declared.issubset(dependencies))
-    return True
+            if ctx.has_file(name):
+                return (name,)
+        return tuple(requirements)
+    for name in ("package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml"):
+        if ctx.has_file(name):
+            return (name,)
+    return ()
+
+
+def _python_declared_names(ctx: RepoContext) -> set[str]:
+    names: set[str] = set()
+    for path in sorted(entry.path for entry in ctx if _REQUIREMENTS_FILE.fullmatch(entry.path)):
+        for line in _requirement_entries(ctx.read_text(path)):
+            if name := _dependency_name(line):
+                names.add(name)
+    value = _toml(ctx, "pyproject.toml") if ctx.has_file("pyproject.toml") else None
+    project = value.get("project") if value else None
+    if isinstance(project, dict):
+        values = list(project.get("dependencies", [])) if isinstance(project.get("dependencies"), list) else []
+        optional = project.get("optional-dependencies")
+        if isinstance(optional, dict):
+            values.extend(item for group in optional.values() if isinstance(group, list) for item in group)
+        names.update(name for item in values if isinstance(item, str) if (name := _dependency_name(item)))
+    tool = value.get("tool") if value else None
+    poetry = tool.get("poetry") if isinstance(tool, dict) else None
+    if isinstance(poetry, dict):
+        for section in ("dependencies", "dev-dependencies"):
+            values = poetry.get(section)
+            if isinstance(values, dict):
+                names.update(str(name).casefold() for name in values if str(name).casefold() != "python")
+    parser = _setup_cfg_parser(ctx.read_text("setup.cfg")) if ctx.has_file("setup.cfg") else None
+    if parser is not None:
+        if parser.has_section("options"):
+            names.update(name for line in _requirement_entries(parser.get("options", "install_requires", fallback="")) if (name := _dependency_name(line)))
+        if parser.has_section("options.extras_require"):
+            for _, value in parser.items("options.extras_require"):
+                names.update(name for line in _requirement_entries(value) if (name := _dependency_name(line)))
+    known, setup_names = _setup_dependency_names(ctx.read_text("setup.py")) if ctx.has_file("setup.py") else (True, set())
+    if known:
+        names.update(setup_names)
+    pipfile = _toml(ctx, "Pipfile") if ctx.has_file("Pipfile") else None
+    if isinstance(pipfile, dict):
+        for section in ("packages", "dev-packages"):
+            packages = pipfile.get(section)
+            if isinstance(packages, dict):
+                names.update(str(name).casefold() for name in packages)
+    return names
+
+
+def _node_declared_names(ctx: RepoContext) -> set[str]:
+    package = _json(ctx, "package.json") if ctx.has_file("package.json") else None
+    if not isinstance(package, dict):
+        return set()
+    names: set[str] = set()
+    for group in _DEPENDENCY_GROUPS:
+        values = package.get(group)
+        if isinstance(values, dict):
+            names.update(str(name) for name in values)
+    for group in ("bundledDependencies", "bundleDependencies"):
+        values = package.get(group)
+        if isinstance(values, list):
+            names.update(str(name) for name in values)
+    return names
+
+
+def _lock_packages(value: dict[str, object]) -> tuple[bool, str, set[str]]:
+    packages = value.get("package")
+    if not isinstance(packages, list) or not packages:
+        return False, "lockfile must contain one or more [[package]] records.", set()
+    names: set[str] = set()
+    for package in packages:
+        if not isinstance(package, dict) or not _nonempty_string(package.get("name")):
+            return False, "each lockfile package record needs a non-empty name.", names
+        names.add(str(package["name"]).casefold())
+        if not (
+            _nonempty_string(package.get("version"))
+            or _nonempty_string(package.get("git"))
+            or _nonempty_string(package.get("path"))
+            or isinstance(package.get("source"), dict)
+        ):
+            return False, "each lockfile package record needs a version or static source.", names
+    return True, "", names
+
+
+def _valid_toml_lock(
+    ctx: RepoContext,
+    path: str,
+    declared: set[str],
+) -> tuple[bool, str]:
+    text, error = _manifest_text(ctx, path)
+    if error:
+        return False, error
+    value = _toml(ctx, path)
+    if value is None:
+        return False, f"{path} must contain valid TOML."
+    if path == "uv.lock":
+        if isinstance(value.get("version"), bool) or not isinstance(value.get("version"), int):
+            return False, "uv.lock needs an integer version field."
+    elif path == "poetry.lock":
+        metadata = value.get("metadata")
+        if not isinstance(metadata, dict) or not _nonempty_string(metadata.get("lock-version")):
+            return False, "poetry.lock needs a [metadata] table with lock-version."
+    elif path == "pdm.lock":
+        metadata = value.get("metadata")
+        lock_version = value.get("lock_version")
+        if lock_version is None and isinstance(metadata, dict):
+            lock_version = metadata.get("lock_version")
+        if not _nonempty_string(lock_version) and not isinstance(lock_version, int):
+            return False, "pdm.lock needs a non-empty lock_version field."
+    valid, detail, names = _lock_packages(value)
+    if not valid:
+        return False, detail
+    missing = sorted(declared - names)
+    if missing:
+        return False, f"{path} does not cover declared dependencies: {', '.join(missing)}."
+    return True, ""
 
 
 def _valid_node_lock(lock: dict[str, object] | None) -> bool:
-    """Accept only the object-shaped npm lockfile forms we can inspect."""
+    """Accept only object-shaped npm lockfiles with dependency records."""
 
     if lock is None:
         return False
@@ -327,11 +782,34 @@ def _valid_node_lock(lock: dict[str, object] | None) -> bool:
         return False
     packages = lock.get("packages")
     dependencies = lock.get("dependencies")
-    if packages is not None and not isinstance(packages, dict):
+    if packages is not None:
+        if not isinstance(packages, dict):
+            return False
+        if any(
+            not _valid_node_package_record(item)
+            for key, item in packages.items()
+            if key != ""
+        ):
+            return False
+    if dependencies is not None:
+        if not isinstance(dependencies, dict):
+            return False
+        if any(not _valid_node_package_record(item) for item in dependencies.values()):
+            return False
+    package_entries = (
+        [key for key in packages if key and key != ""]
+        if isinstance(packages, dict)
+        else []
+    )
+    return bool(package_entries or (isinstance(dependencies, dict) and dependencies))
+
+
+def _valid_node_package_record(value: object) -> bool:
+    if not isinstance(value, dict):
         return False
-    if dependencies is not None and not isinstance(dependencies, dict):
-        return False
-    return isinstance(packages, dict) or isinstance(dependencies, dict)
+    if value.get("link") is True:
+        return True
+    return any(_nonempty_string(value.get(key)) for key in ("version", "resolved", "integrity"))
 
 
 def _valid_pipfile_lock(ctx: RepoContext, path: str) -> bool:
@@ -341,7 +819,183 @@ def _valid_pipfile_lock(ctx: RepoContext, path: str) -> bool:
     if lock is None or not isinstance(lock.get("_meta"), dict):
         return False
     sections = [lock[name] for name in ("default", "develop") if name in lock]
-    return bool(sections) and all(isinstance(section, dict) for section in sections)
+    if not sections or not all(isinstance(section, dict) for section in sections):
+        return False
+    for section in sections:
+        if not section:
+            continue
+        for package, record in section.items():
+            if not isinstance(package, str) or not package.strip() or not isinstance(record, dict):
+                return False
+            if not any(
+                _nonempty_string(record.get(key))
+                for key in ("version", "path", "editable", "file")
+            ):
+                return False
+    return any(bool(section) for section in sections)
+
+
+def _node_lock_covers(lock: dict[str, object], declared: set[str]) -> set[str]:
+    covered: set[str] = set()
+    packages = lock.get("packages")
+    if isinstance(packages, dict):
+        for name in declared:
+            suffix = f"node_modules/{name}"
+            if any(str(path) == suffix or str(path).endswith(f"/{suffix}") for path in packages):
+                covered.add(name)
+    dependencies = lock.get("dependencies")
+    if isinstance(dependencies, dict):
+        covered.update(name for name in declared if name in dependencies)
+    return covered
+
+
+def _valid_yarn_lock(text: str | None, declared: set[str]) -> tuple[bool, str]:
+    if text is None:
+        return False, "yarn.lock is unreadable."
+    active = [line for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+    if not active:
+        return False, "yarn.lock is empty or contains only comments."
+    stanzas: list[dict[str, object]] = []
+    current: dict[str, bool] | None = None
+    for line in active:
+        stripped = line.strip()
+        indented = line.startswith((" ", "\t"))
+        if not indented:
+            if not stripped.endswith(":"):
+                return False, "yarn.lock contains a malformed top-level selector."
+            key = stripped[:-1].strip().strip('"\'')
+            current = {"metadata": key == "__metadata", "version": False, "names": set()}
+            if not current["metadata"]:
+                selectors = key.split(",")
+                current["names"] = {
+                    selector_name(selector.strip())
+                    for selector in selectors
+                    if selector_name(selector.strip())
+                }
+            stanzas.append(current)
+            continue
+        if current is None:
+            return False, "yarn.lock contains an indented record without a selector."
+        if re.match(r"^(?:version|resolution)\s*:\s*\S+", stripped):
+            current["version"] = True
+    packages = [stanza for stanza in stanzas if not stanza["metadata"]]
+    if not packages or not all(stanza["version"] for stanza in packages):
+        return False, "yarn.lock needs at least one package selector with a version or resolution."
+    covered = set().union(*(stanza["names"] for stanza in packages))
+    missing = sorted(declared - covered)
+    if missing:
+        return False, f"yarn.lock does not cover declared dependencies: {', '.join(missing)}."
+    return True, ""
+
+
+def _valid_pnpm_lock(text: str | None, declared: set[str]) -> tuple[bool, str]:
+    if text is None:
+        return False, "pnpm-lock.yaml is unreadable."
+    active = [line for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+    if not active:
+        return False, "pnpm-lock.yaml is empty or contains only comments."
+    first = active[0]
+    match = re.fullmatch(r"lockfileVersion\s*:\s*['\"]?(\d+(?:\.\d+)?)['\"]?\s*", first.strip())
+    if not match:
+        return False, "pnpm-lock.yaml needs a numeric lockfileVersion at the top level."
+    sections: dict[str, int] = {}
+    covered: set[str] = set()
+    active_section: str | None = None
+    pending_record_depths: list[int] = []
+    for line in active:
+        indentation = len(line) - len(line.lstrip())
+        pending_record_depths = [depth for depth in pending_record_depths if indentation <= depth]
+        if "\t" in line[: len(line) - len(line.lstrip())]:
+            return False, "pnpm-lock.yaml must use spaces for indentation."
+        if not re.match(r"^\s*(?:[^:#\"']+|['\"][^\"']+['\"])\s*:", line):
+            return False, "pnpm-lock.yaml contains a malformed YAML mapping line."
+        if not line.startswith((" ", "\t")):
+            key = line.split(":", 1)[0].strip().strip('"\'')
+            sections[key] = 0
+            active_section = key
+        elif sections:
+            parent = active_section or next(reversed(sections))
+            if parent in {"packages", "snapshots", "dependencies", "importers"} and line.strip().endswith(":"):
+                sections[parent] += 1
+                candidate = line.strip().split(":", 1)[0].strip('"\'')
+                for name in declared:
+                    if candidate == name or candidate.startswith(f"{name}@") or candidate.endswith(f"/{name}"):
+                        covered.add(name)
+                if parent in {"packages", "snapshots"} and "@" in candidate:
+                    pending_record_depths.append(indentation)
+    if not any(sections.get(name, 0) for name in ("packages", "snapshots", "dependencies", "importers")):
+        return False, "pnpm-lock.yaml needs a non-empty packages, snapshots, dependencies, or importers section."
+    if pending_record_depths:
+        return False, "pnpm-lock.yaml contains a package record without a non-empty record body."
+    missing = sorted(declared - covered)
+    if missing:
+        return False, f"pnpm-lock.yaml does not cover declared dependencies: {', '.join(missing)}."
+    return True, ""
+
+
+def selector_name(selector: str) -> str | None:
+    selector = selector.strip().strip('"\'')
+    if selector.startswith("@"):
+        marker = selector.find("@", 1)
+        return selector[:marker].casefold() if marker > 0 else selector.casefold()
+    return selector.split("@", 1)[0].casefold() or None
+
+
+def _validate_lock(ctx: RepoContext, path: str, ecosystem: str, declared: set[str]) -> tuple[bool, str]:
+    if ecosystem == "python":
+        if _REQUIREMENTS_FILE.fullmatch(path):
+            text = ctx.read_text(path)
+            if not _valid_requirements_lock(text):
+                return False, "every requirements dependency must be pinned with == and the file must be non-empty"
+            names = {
+                name
+                for line in _requirement_entries(text)
+                if (name := _dependency_name(line))
+            }
+            missing = sorted(declared - names)
+            return (not missing, f"{path} does not cover declared dependencies: {', '.join(missing)}." if missing else "")
+        if path == "Pipfile.lock":
+            if not _valid_pipfile_lock(ctx, path):
+                return False, "Pipfile.lock must be valid JSON with non-empty _meta, default, or develop records."
+            lock = _json(ctx, path) or {}
+            covered = {
+                str(name).casefold()
+                for section in ("default", "develop")
+                if isinstance(lock.get(section), dict)
+                for name in lock[section]
+            }
+            missing = sorted(name for name in declared if name not in covered)
+            return (not missing, f"Pipfile.lock does not cover declared dependencies: {', '.join(missing)}." if missing else "")
+        return _valid_toml_lock(ctx, path, declared)
+    if path in {"package-lock.json", "npm-shrinkwrap.json"}:
+        lock = _json(ctx, path)
+        if not _valid_node_lock(lock):
+            return False, f"{path} must be valid JSON with lockfileVersion 1, 2, or 3 and dependency records."
+        assert lock is not None
+        missing = sorted(declared - _node_lock_covers(lock, declared))
+        return (not missing, f"{path} does not cover declared dependencies: {', '.join(missing)}." if missing else "")
+    if path == "yarn.lock":
+        return _valid_yarn_lock(ctx.read_text(path), declared)
+    return _valid_pnpm_lock(ctx.read_text(path), declared)
+
+
+def _lock_status(ctx: RepoContext, ecosystem: str) -> tuple[bool | None, list[Finding]]:
+    if not _dependencies(ctx, ecosystem):
+        return None, []
+    paths = _lock_paths(ctx, ecosystem)
+    declared = _python_declared_names(ctx) if ecosystem == "python" else _node_declared_names(ctx)
+    if not paths:
+        return False, [_finding(".", f"{ecosystem.title()} dependencies are declared but no supported lockfile was found.")]
+    findings: list[Finding] = []
+    for path in paths:
+        valid, detail = _validate_lock(ctx, path, ecosystem, declared)
+        if not valid:
+            findings.append(_finding(path, detail or "Lockfile is malformed or empty."))
+    return (not findings, findings)
+
+
+def _lock_ok(ctx: RepoContext, ecosystem: str) -> bool | None:
+    return _lock_status(ctx, ecosystem)[0]
 
 
 def _ecosystem_score(rule_id: str, ecosystems: tuple[str, ...], evaluator: Callable[[str], bool | None], missing_message: str) -> CheckResult:
@@ -356,7 +1010,24 @@ def _ecosystem_score(rule_id: str, ecosystems: tuple[str, ...], evaluator: Calla
 
 
 def rr06(ctx: RepoContext, ecosystems: tuple[str, ...]) -> CheckResult:
-    return _ecosystem_score("RR06", ecosystems, lambda ecosystem: _lock_ok(ctx, ecosystem), "No supported project manifest found.")
+    if not ecosystems:
+        return _result(
+            "RR06",
+            0,
+            [_finding(".", "No supported project manifest found.")],
+            message="No supported project manifest found.",
+            fixable=False,
+        )
+    outcomes: list[bool | None] = []
+    findings: list[Finding] = []
+    for ecosystem in ecosystems:
+        outcome, ecosystem_findings = _lock_status(ctx, ecosystem)
+        outcomes.append(outcome)
+        findings.extend(ecosystem_findings)
+    if all(outcome is None for outcome in outcomes):
+        return _result("RR06", CHECK_WEIGHTS["RR06"], na=True)
+    earned = round(CHECK_WEIGHTS["RR06"] * sum(outcome is not False for outcome in outcomes) / len(outcomes))
+    return _result("RR06", earned, findings)
 
 
 def _runtime_ok(ctx: RepoContext, ecosystem: str) -> bool:

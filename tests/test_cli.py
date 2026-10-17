@@ -255,16 +255,27 @@ def test_empty_dockerfile_is_rejected(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("manifest", "manifest_text", "lockfile"),
+    ("manifest", "manifest_text", "lockfile", "detail"),
     (
-        ("package.json", '{"name":"fixture","dependencies":{"fixture-lib":"1.0.0"}}\n', "package-lock.json"),
-        ("Pipfile", "[packages]\nfixture-lib = \"*\"\n", "Pipfile.lock"),
+        (
+            "package.json",
+            '{"name":"fixture","dependencies":{"fixture-lib":"1.0.0"}}\n',
+            "package-lock.json",
+            "package-lock.json must be valid JSON with lockfileVersion 1, 2, or 3 and dependency records.",
+        ),
+        (
+            "Pipfile",
+            "[packages]\nfixture-lib = \"*\"\n",
+            "Pipfile.lock",
+            "Pipfile.lock must be valid JSON with non-empty _meta, default, or develop records.",
+        ),
     ),
 )
 def test_malformed_lockfiles_are_rejected(
     manifest: str,
     manifest_text: str,
     lockfile: str,
+    detail: str,
     tmp_path: Path,
 ) -> None:
     (tmp_path / manifest).write_text(manifest_text, encoding="utf-8")
@@ -273,9 +284,9 @@ def test_malformed_lockfiles_are_rejected(
     assert item["earned"] == 0
     assert item["status"] == "fail"
     assert item["findings"] == [{
-        "file": ".",
+        "file": lockfile,
         "line": None,
-        "detail": f"{'Node' if manifest == 'package.json' else 'Python'} project does not satisfy this check.",
+        "detail": detail,
     }]
 
 
