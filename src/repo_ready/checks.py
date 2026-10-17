@@ -1055,41 +1055,143 @@ def rr07(ctx: RepoContext, ecosystems: tuple[str, ...]) -> CheckResult:
     return _ecosystem_score("RR07", ecosystems, lambda ecosystem: _runtime_ok(ctx, ecosystem), "No supported project manifest found.")
 
 
+def _root_dockerfile(ctx: RepoContext) -> tuple[str | None, str | None]:
+    """Select one root container file without hiding an unreadable primary file."""
+
+    for path in ("Dockerfile", "Containerfile"):
+        entry = ctx.entry(path)
+        if entry is not None:
+            return path, ctx.read_text(entry)
+    return None, None
+
+
+def _dockerfile_instructions(text: str) -> tuple[tuple[str, int, str], ...]:
+    """Return supported instructions while ignoring full-line comments."""
+
+    instructions: list[tuple[str, int, str]] = []
+    logical_lines: list[tuple[int, str]] = []
+    pending = ""
+    pending_line = 0
+    heredoc_end: str | None = None
+    for line_number, line in enumerate(text.splitlines(), 1):
+        if heredoc_end is not None:
+            if line.strip() == heredoc_end:
+                heredoc_end = None
+            continue
+        stripped = line.lstrip()
+        if pending:
+            pending += stripped
+        else:
+            pending = line
+            pending_line = line_number
+        if pending.rstrip().endswith("\\"):
+            pending = pending.rstrip()[:-1].rstrip() + " "
+            continue
+        logical_lines.append((pending_line, pending))
+        pending = ""
+        match = re.match(r"(?i)^\s*(?:RUN|COPY|ADD)\s+<<-?\s*([A-Za-z_][A-Za-z0-9_]*)", line)
+        if match:
+            heredoc_end = match.group(1)
+    if pending:
+        logical_lines.append((pending_line, pending))
+    for line_number, line in logical_lines:
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = re.match(r"(?i)^(FROM|CMD|ENTRYPOINT)(?:\s+|$)(.*)$", stripped)
+        if match:
+            instructions.append((match.group(1).upper(), line_number, match.group(2).strip()))
+    return tuple(instructions)
+
+
+def _docker_image(body: str) -> str | None:
+    """Extract a FROM image after static FROM flags such as --platform."""
+
+    for token in body.split():
+        if not token.startswith("--") and not token.startswith("#"):
+            return token
+    return None
+
+
+def _docker_image_is_pinned(image: str | None) -> bool:
+    if not image:
+        return False
+    if "@" in image:
+        return bool(image.rsplit("@", 1)[1])
+    last_component = image.rsplit("/", 1)[-1]
+    if ":" not in last_component:
+        return False
+    tag = last_component.rsplit(":", 1)[1]
+    return bool(tag) and tag.casefold() != "latest"
+
+
+def _docker_command_is_present(body: str) -> bool:
+    body = body.strip()
+    if not body or body.startswith("#") or body in {"\\", "[]", "{}"}:
+        return False
+    if body.startswith("[") and body.endswith("]"):
+        try:
+            return bool(json.loads(body))
+        except json.JSONDecodeError:
+            return False
+    return True
+
+
 def rr08(ctx: RepoContext) -> CheckResult:
-    selected = _text(ctx, ("Dockerfile", "Containerfile"))
-    if selected is None:
-        entries = (ctx.entry("Dockerfile"), ctx.entry("Containerfile"))
-        detail = (
-            "Root Dockerfile or Containerfile is empty or unreadable."
-            if any(entry is not None for entry in entries)
-            else "Root Dockerfile or Containerfile is missing."
-        )
-        return _result("RR08", 0, [_finding("Dockerfile", detail)])
-    path, text = selected
-    if not text.strip():
+    path, text = _root_dockerfile(ctx)
+    if path is None:
+        return _result("RR08", 0, [_finding("Dockerfile", "Root Dockerfile or Containerfile is missing.")])
+    if text is None or not text.strip():
         return _result("RR08", 0, [_finding(path, "Root Dockerfile or Containerfile is empty or unreadable.")])
+
+    instructions = _dockerfile_instructions(text)
+    from_instructions = [item for item in instructions if item[0] == "FROM"]
+    command_instructions = [
+        item for item in instructions
+        if item[0] in {"CMD", "ENTRYPOINT"} and _docker_command_is_present(item[2])
+    ]
     earned = 6
     findings: list[Finding] = []
-    from_match = re.search(r"(?im)^\s*FROM\s+([^\s#]+)", text)
-    if from_match:
-        image = from_match.group(1)
-        tag_or_digest = "@" in image or (":" in image.rsplit("/", 1)[-1] and not image.casefold().endswith(":latest"))
-        if tag_or_digest:
+    if not from_instructions:
+        findings.append(_finding(path, "Dockerfile has no FROM instruction."))
+    else:
+        unpinned = [
+            item for item in from_instructions
+            if not _docker_image_is_pinned(_docker_image(item[2]))
+        ]
+        if not unpinned:
             earned += 3
         else:
-            findings.append(_finding(path, "FROM must use an explicit non-latest tag or digest.", _line_number(text, from_match.start())))
-    else:
-        findings.append(_finding(path, "Dockerfile has no FROM instruction."))
-    command = re.search(r"(?im)^\s*(?:CMD|ENTRYPOINT)\s+\S+", text)
-    if command:
+            findings.extend(
+                _finding(path, "FROM must use an explicit non-latest tag or digest.", line)
+                for _, line, _ in unpinned
+            )
+
+    # A command in an earlier build stage is not part of the final image.
+    final_stage = -1
+    for index, (instruction, _, _) in enumerate(instructions):
+        if instruction == "FROM":
+            final_stage = index
+    final_stage_instructions = instructions[final_stage + 1:] if final_stage >= 0 else ()
+    final_command = any(
+        instruction in {"CMD", "ENTRYPOINT"} and _docker_command_is_present(body)
+        for instruction, _, body in final_stage_instructions
+    )
+    command_ok = final_command if final_stage >= 0 else bool(command_instructions)
+    if command_ok:
         earned += 3
     else:
         findings.append(_finding(path, "Dockerfile has no CMD or ENTRYPOINT instruction."))
     return _result("RR08", earned, findings)
 
 
-def _line_number(text: str, offset: int) -> int:
-    return text.count("\n", 0, offset) + 1
+def _make_recipe_command(value: str) -> str | None:
+    command = value.strip()
+    while command and command[0] in "@+-":
+        command = command[1:].lstrip()
+    if not command or command.startswith("#"):
+        return None
+    return command
 
 
 def _make_test_command(text: str) -> str | None:
@@ -1098,14 +1200,58 @@ def _make_test_command(text: str) -> str | None:
         match = re.match(r"^\s*test\s*:\s*(.*)$", line)
         if not match:
             continue
-        inline = match.group(1).strip()
+        inline_text = match.group(1).strip()
+        inline = _make_recipe_command(inline_text[1:]) if inline_text.startswith(";") else None
         if inline:
             return inline
         for recipe in lines[index + 1:]:
+            if recipe.lstrip().startswith("#"):
+                continue
             if recipe.startswith(("\t", "    ")) and recipe.strip():
-                return recipe.strip()
+                command = _make_recipe_command(recipe)
+                if command:
+                    return command
+                continue
             if recipe and not recipe.startswith((" ", "\t")):
                 break
+    return None
+
+
+def _config_test_command(ctx: RepoContext) -> str | None:
+    for path, command in (("pytest.ini", "pytest"), ("tox.ini", "tox"), ("noxfile.py", "nox")):
+        if not _nonempty(ctx, (path,)):
+            continue
+        text = ctx.read_text(path)
+        if text is None:
+            continue
+        if path == "noxfile.py":
+            if re.search(r"(?m)^\s*(?:def|class)\s+(?:session|test)\b", text):
+                return f"{command} ({path})"
+        else:
+            parser = configparser.RawConfigParser(interpolation=None)
+            try:
+                parser.read_string(text)
+            except configparser.Error:
+                continue
+            if parser.sections():
+                return f"{command} ({path})"
+
+    setup_cfg = ctx.read_text("setup.cfg")
+    if setup_cfg and re.search(r"(?im)^\s*\[tool:pytest\]\s*$", setup_cfg):
+        return "pytest (setup.cfg [tool:pytest])"
+
+    pyproject = ctx.read_text("pyproject.toml")
+    if pyproject:
+        match = re.search(r"(?im)^\s*\[tool\.(pytest|tox|nox)(?:[.\]])", pyproject)
+        if match:
+            command = match.group(1)
+            try:
+                document = tomllib.loads(pyproject)
+            except tomllib.TOMLDecodeError:
+                return None
+            tool = document.get("tool") if isinstance(document, dict) else None
+            if isinstance(tool, dict) and isinstance(tool.get(command), dict):
+                return f"{command} (pyproject.toml [tool.{command}])"
     return None
 
 
@@ -1114,20 +1260,16 @@ def _test_command(ctx: RepoContext) -> str | None:
     if make:
         command = _make_test_command(make[1])
         if command:
-            return f"make test ({command})"
+            return f"make test ({make[0]}: {command})"
+
     package = _json(ctx, "package.json")
     if package:
         scripts = package.get("scripts")
         command = scripts.get("test") if isinstance(scripts, dict) else None
         if isinstance(command, str) and command.strip() and "no test specified" not in command.casefold():
-            return f"npm test ({command.strip()})"
-    for name in ("pytest.ini", "tox.ini", "noxfile.py"):
-        if _nonempty(ctx, (name,)):
-            return name
-    pyproject = ctx.read_text("pyproject.toml")
-    if pyproject and re.search(r"(?im)^\s*\[tool\.(?:pytest|tox|nox)", pyproject):
-        return "pytest configuration in pyproject.toml"
-    return None
+            return f"npm test (package.json scripts.test: {command.strip()})"
+
+    return _config_test_command(ctx)
 
 
 def rr09(ctx: RepoContext, ecosystems: tuple[str, ...]) -> CheckResult:
