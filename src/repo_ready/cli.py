@@ -17,6 +17,7 @@ from .context import ConfigError, RepoContext
 from .fixer import PlannedFile, apply_fix_plan, plan_fixes, project_fix_score, protect_score
 from .formats import render_markdown, render_sarif
 from .tracked import inspect_tracked
+from .registry import rule_descriptors
 from .scoring import report
 
 
@@ -59,6 +60,9 @@ def _parser() -> argparse.ArgumentParser:
     tracked = commands.add_parser("tracked", help="list paths recorded in the Git index")
     tracked.add_argument("path", nargs="?", type=Path, default=None)
     tracked.add_argument("--json", action="store_true", dest="as_json")
+
+    rules = commands.add_parser("rules", help="list the readiness rule registry")
+    rules.add_argument("--json", action="store_true", dest="as_json")
 
     fix = commands.add_parser("fix", help="scaffold missing repository files")
     fix.add_argument("path", nargs="?", type=Path, default=None)
@@ -206,6 +210,16 @@ def _run_tracked(args: argparse.Namespace, repository: Path) -> int:
         for finding in result.findings:
             print(f"{finding['severity'].upper()} {finding['code']}: {finding['detail']}")
     return 0 if result.safe else 1
+
+
+def _run_rules(args: argparse.Namespace) -> int:
+    values = [item.as_dict() for item in rule_descriptors()]
+    if args.as_json:
+        print(json.dumps(values, indent=2))
+    else:
+        for item in values:
+            print(f"{item['id']} {item['title']} ({item['weight']} points)")
+    return 0
 
 
 def _run_fix(args: argparse.Namespace, repository: Path) -> int:
@@ -365,13 +379,15 @@ def main(argv: list[str] | None = None) -> int:
         print(__version__)
         return 0
     args = _parser().parse_args(argv)
-    supplied_path = args.path if args.path is not None else Path.cwd()
+    supplied_path = getattr(args, "path", None) or Path.cwd()
     if args.command == "artifact":
         try:
             return _run_artifact(args)
         except OSError as error:
             print(f"repo-ready: artifact error: {error}", file=sys.stderr)
             return 2
+    if args.command == "rules":
+        return _run_rules(args)
     repository = _resolve_repository(supplied_path)
     if repository is None:
         print(f"repo-ready: repository path is not a directory or is unreadable: {supplied_path}", file=sys.stderr)

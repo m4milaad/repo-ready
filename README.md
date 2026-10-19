@@ -124,6 +124,12 @@ The comparison output has its own versioned schema. It exits `1` when the
 score or check evidence regresses, `0` when there is no regression, and `2`
 when the baseline is missing or invalid.
 
+The stable readiness rule registry is also available for integrations:
+
+```sh
+repo-ready rules --json
+```
+
 ### Release artifact inspection
 
 Inspect a wheel or source distribution without extracting or executing it:

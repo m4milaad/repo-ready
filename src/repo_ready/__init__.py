@@ -7,6 +7,7 @@ from .contracts import ContractDiagnostic, ContractEdge, ContractGraph, Evidence
 from .baseline import ReportComparison, compare_reports, compare_repository
 from .artifact import ArtifactFinding, ArtifactMember, ArtifactReport, inspect_artifact
 from .tracked import TrackedFile, TrackedReport, inspect_tracked
+from .registry import RuleDescriptor, rule_descriptors
 from .models import CheckResult, Finding, ScanReport
 from .scoring import build_report, report, scan, scan_repository
 
@@ -33,6 +34,8 @@ __all__ = [
     "TrackedFile",
     "TrackedReport",
     "inspect_tracked",
+    "RuleDescriptor",
+    "rule_descriptors",
     "report",
     "scan",
     "scan_repository",
