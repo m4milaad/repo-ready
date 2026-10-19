@@ -112,6 +112,19 @@ The comparison output has its own versioned schema. It exits `1` when the
 score or check evidence regresses, `0` when there is no regression, and `2`
 when the baseline is missing or invalid.
 
+### Release artifact inspection
+
+Inspect a wheel or source distribution without extracting or executing it:
+
+```sh
+repo-ready artifact dist/repo_ready-0.1.0-py3-none-any.whl --project . --json
+```
+
+The artifact report checks member paths, links, duplicate members, size
+limits, required Python distribution metadata, project/version parity, and
+missing source modules. Artifact inspection is independent of readiness
+scoring and uses its own versioned schema.
+
 ### Exit codes
 
 | Code | Meaning |

@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 from . import __version__
+from .artifact import inspect_artifact
 from .baseline import BaselineError, compare_repository
 from .contracts import diagnose
 from .context import ConfigError, RepoContext
@@ -44,6 +45,11 @@ def _parser() -> argparse.ArgumentParser:
     compare.add_argument("path", nargs="?", type=Path, default=None)
     compare.add_argument("--baseline", required=True, type=Path)
     compare.add_argument("--json", action="store_true", dest="as_json")
+
+    artifact = commands.add_parser("artifact", help="inspect a wheel or source distribution")
+    artifact.add_argument("path", type=Path)
+    artifact.add_argument("--project", type=Path, default=None)
+    artifact.add_argument("--json", action="store_true", dest="as_json")
 
     fix = commands.add_parser("fix", help="scaffold missing repository files")
     fix.add_argument("path", nargs="?", type=Path, default=None)
@@ -151,6 +157,21 @@ def _run_compare(args: argparse.Namespace, repository: Path) -> int:
         else:
             print("Changes: none")
     return 1 if comparison.regressed else 0
+
+
+def _run_artifact(args: argparse.Namespace) -> int:
+    result = inspect_artifact(args.path, project=args.project)
+    if args.as_json:
+        print(json.dumps(result.as_dict(), indent=2))
+    else:
+        print(f"Artifact: {result.artifact}")
+        print(f"Format: {result.format}")
+        print(f"Safe: {'yes' if result.safe else 'no'}")
+        print(f"Members: {len(result.members)}")
+        for finding in result.findings:
+            member = f" ({finding.member})" if finding.member else ""
+            print(f"{finding.severity.upper()} {finding.code}{member}: {finding.detail}")
+    return 0 if result.safe else 1
 
 
 def _run_fix(args: argparse.Namespace, repository: Path) -> int:
@@ -292,6 +313,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     args = _parser().parse_args(argv)
     supplied_path = args.path if args.path is not None else Path.cwd()
+    if args.command == "artifact":
+        try:
+            return _run_artifact(args)
+        except OSError as error:
+            print(f"repo-ready: artifact error: {error}", file=sys.stderr)
+            return 2
     repository = _resolve_repository(supplied_path)
     if repository is None:
         print(f"repo-ready: repository path is not a directory or is unreadable: {supplied_path}", file=sys.stderr)
