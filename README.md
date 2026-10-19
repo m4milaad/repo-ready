@@ -51,6 +51,11 @@ python -m repo_ready check .
 the same CLI through the package module. Both commands default to the current
 directory when no repository path is supplied.
 
+CI and Docker use a non-editable wheel install so their test runs verify the
+packaged application rather than importing directly from `src/`. The test
+suite normally adds `src/` for convenient local checkout testing; set
+`REPO_READY_TEST_NO_SRC=1` when checking an installed artifact.
+
 ## Run
 
 ### Check a repository
@@ -101,12 +106,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Install the locked tools and package
+      - name: Install the locked tools
         run: |
           python -m pip install -r requirements.lock
-          python -m pip install --no-build-isolation -e .
-      - name: Run tests
-        run: python -m pytest -q
+      - name: Build and install the wheel
+        run: |
+          python -m pip wheel --no-deps --no-build-isolation --wheel-dir /tmp/repo-ready-wheel .
+          python -m pip install --no-index --force-reinstall --no-deps /tmp/repo-ready-wheel/*.whl
+      - name: Run installed-package tests
+        env:
+          PYTHONPATH: ''
+          REPO_READY_TEST_NO_SRC: '1'
+        run: |
+          python -m pip check
+          python -c "from pathlib import Path; import repo_ready; package = Path(repo_ready.__file__).resolve(); assert Path.cwd() / 'src' not in package.parents, package"
+          python -m pytest -q
       - name: Check repository readiness
         run: python -m repo_ready check . --json --min-score 80
 ```
@@ -161,8 +175,10 @@ docker run --rm -v "$PWD":/work repo-ready repo-ready check /work --json
 ```
 
 The Docker image has no Make dependency and its default command is
-`python -m pytest -q`. `.dockerignore` keeps local virtual environments,
-caches, and build artifacts out of the build context.
+`python -m pytest -q`. It installs the project as a wheel-equivalent
+non-editable package and disables the test suite's checkout-source path
+injection. `.dockerignore` keeps local virtual environments, caches, and build
+artifacts out of the build context.
 
 To check a different local repository, build the image from the `repo-ready`
 checkout and mount the target repository at `/work`:

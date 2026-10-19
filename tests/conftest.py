@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import socket
 import subprocess
 import sys
@@ -8,7 +9,7 @@ import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
-if str(SRC_ROOT) not in sys.path:
+if os.environ.get("REPO_READY_TEST_NO_SRC") != "1" and str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 
