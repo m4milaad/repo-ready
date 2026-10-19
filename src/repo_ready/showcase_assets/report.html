@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="@@CSP@@">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="description" content="Offline repository field notes: static evidence, precomputed scenarios, and proposed repairs.">
+  <title>@@NAME@@ — repo-ready field notes</title>
+  <style>@@STYLE@@</style>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to report</a>
+  <div class="page">
+    <header class="masthead">
+      <p class="wordmark">repo-ready <span>/ Engineering Field Notes</span></p>
+      <p class="edition">Offline report · v0.1.0</p>
+    </header>
+    <main id="main" tabindex="-1">
+      <div class="report-heading">
+        <p class="eyebrow">Repository / static analysis</p>
+        <h1>@@NAME@@</h1>
+        <p class="repository-meta">@@FILES@@ files · @@SCOPE@@ scope · @@COMPLETENESS@@</p>
+        <p class="intro">A record of what the files say. Follow the evidence, compare a precomputed scenario, and review a proposed repair.</p>
+      </div>
+      <div id="static-report">@@STATIC@@</div>
+      <div id="interactive-report" hidden>
+        <nav class="section-nav" aria-label="Report sections">
+          <a href="#overview">Observation</a>
+          <a href="#lab">Breakage Lab</a>
+          <a href="#contracts">Diagnostics</a>
+          <a href="#evidence">Evidence</a>
+          <a href="#repair">Repair</a>
+        </nav>
+
+        <section id="overview" class="overview" aria-labelledby="overview-title">
+          <div>
+            <p class="eyebrow">01 / Readiness observation</p>
+            <h2 id="overview-title">Observed (static)</h2>
+            <p class="score"><span id="score-value">—</span><span class="score-denominator"> / <span id="score-max">100</span></span></p>
+            <p id="score-grade" class="grade"></p>
+          </div>
+          <div class="margin-note">
+            <p class="note-label">Read this score as evidence</p>
+            <p>Static inspection describes repository files. It does not establish that a build or test will succeed.</p>
+            <p id="view-description"></p>
+            <p id="score-delta" class="mono"></p>
+          </div>
+        </section>
+
+        <section id="lab" class="report-section" aria-labelledby="lab-title">
+          <div class="section-heading">
+            <div><p class="eyebrow">02 / Counterfactuals</p><h2 id="lab-title">Breakage Lab</h2></div>
+            <button id="reset-view" type="button">Reset to original</button>
+          </div>
+          <p class="section-intro">Switch between the original observation and supplied simulations. Every result here was computed before this report was rendered.</p>
+          <p id="view-status" class="sr-only" role="status" aria-live="polite"></p>
+          <div id="scenario-options" class="scenario-options" role="group" aria-label="Choose a precomputed view"></div>
+          <div id="scenario-details" class="scenario-details" hidden>
+            <h3>Simulated changes</h3><ul id="scenario-changes" class="plain-list"></ul>
+            <p id="affected-files" class="mono"></p>
+            <p id="scenario-comparison" class="mono"></p>
+            <div class="comparison-columns">
+              <div><h3>New diagnostics</h3><ul id="new-diagnostics" class="plain-list"></ul></div>
+              <div><h3>Resolved diagnostics</h3><ul id="resolved-diagnostics" class="plain-list"></ul></div>
+            </div>
+          </div>
+        </section>
+
+        <section id="checks" class="report-section" aria-labelledby="checks-title">
+          <p class="eyebrow">03 / Checklist</p><h2 id="checks-title">Readiness checks</h2>
+          <div id="check-list"></div>
+        </section>
+
+        <section id="contracts" class="report-section" aria-labelledby="contracts-title">
+          <div class="section-heading">
+            <div><p class="eyebrow">04 / Cross-file contracts</p><h2 id="contracts-title">Follow a diagnostic</h2></div>
+            <button id="clear-selection" type="button" disabled>Clear selection</button>
+          </div>
+          <p class="section-intro">Select a diagnostic to highlight its connected evidence chain. Select a file or ledger row to inspect its source facts.</p>
+          <div id="diagnostic-list" class="diagnostic-list"></div>
+          <p id="selection-status" class="selection-status" role="status" aria-live="polite">No evidence chain selected.</p>
+          <h3>File schematic</h3>
+          <p class="caption">Deterministic file lanes, grouped by purpose. Lines of evidence are listed as relationships below.</p>
+          <div id="file-schematic" class="file-schematic"></div>
+          <h3>Relationships</h3>
+          <ul id="relationship-list" class="relationship-list"></ul>
+        </section>
+
+        <section id="evidence" class="report-section" aria-labelledby="evidence-title">
+          <p class="eyebrow">05 / Source ledger</p><h2 id="evidence-title">Inspect the evidence</h2>
+          <div class="evidence-controls">
+            <div class="search-control"><label for="evidence-search">Search evidence</label><input id="evidence-search" type="search" placeholder="Path, value, subject, or ID" autocomplete="off" spellcheck="false"></div>
+            <div><label for="evidence-kind">Evidence kind</label><select id="evidence-kind">
+              <option value="all">All kinds</option><option value="document">Document</option>
+              <option value="command">Command</option><option value="manifest">Manifest</option>
+              <option value="dependency">Dependency</option><option value="lockfile">Lockfile</option>
+              <option value="runtime">Runtime</option><option value="container">Container</option>
+              <option value="workflow">Workflow</option><option value="artifact">Artifact</option>
+            </select></div>
+            <button id="clear-filters" type="button">Clear filters</button>
+          </div>
+          <label class="checkbox-label"><input id="chain-only" type="checkbox" disabled> Selected chain only</label>
+          <p id="filter-status" class="caption" role="status" aria-live="polite"></p>
+          <div id="evidence-empty" class="empty" hidden></div>
+          <div id="evidence-table-region" class="table-scroll" tabindex="0" role="region" aria-label="Evidence ledger, horizontally scrollable">
+            <table>
+              <caption>Source facts for the selected view. Use an Inspect button to read the complete record.</caption>
+              <thead><tr><th scope="col">File / line</th><th scope="col">Kind / subject</th><th scope="col">Value</th><th scope="col">Record</th></tr></thead>
+              <tbody id="evidence-rows"></tbody>
+            </table>
+          </div>
+          <div id="evidence-pagination" class="pagination">
+            <button id="previous-page" type="button">Previous records</button><span id="page-status" class="mono"></span><button id="next-page" type="button">Next records</button>
+          </div>
+          <section id="evidence-detail" class="evidence-detail" aria-labelledby="detail-title" hidden>
+            <h3 id="detail-title">Selected record</h3><dl id="detail-fields"></dl>
+          </section>
+        </section>
+
+        <section id="repair" class="report-section" aria-labelledby="repair-title">
+          <div class="section-heading">
+            <div><p class="eyebrow">06 / Proposed changes</p><h2 id="repair-title">Repair notes</h2></div>
+            <a id="download-patch" class="button-link" download="repo-ready-repair.patch" hidden>Download patch</a>
+          </div>
+          <p>Proposed text for review. Projected scores describe the supplied repair plan.</p>
+          <p id="repair-projection" class="projection"></p>
+          <ul id="repair-operations" class="plain-list"></ul>
+          <p id="patch-empty" class="empty"></p>
+          <pre id="repair-patch" class="patch" tabindex="0" aria-label="Proposed repair patch" hidden></pre>
+          <h3>Manual review</h3><ul id="manual-notes" class="plain-list"></ul>
+          <h3>Repair limits</h3><ul id="repair-limits" class="plain-list"></ul>
+        </section>
+
+        <section class="report-section" aria-labelledby="limits-title">
+          <p class="eyebrow">07 / Scope of observation</p><h2 id="limits-title">Analysis limits</h2>
+          <ul id="analysis-limits" class="plain-list"></ul>
+        </section>
+      </div>
+
+      <section id="receipt" class="report-section receipt" aria-labelledby="receipt-title">
+        <div class="section-heading">
+          <div><p class="eyebrow">08 / Evidence receipt</p><h2 id="receipt-title">Keep the record</h2></div>
+          <a id="download-receipt" class="button-link" download="repo-ready-receipt.json" hidden>Download receipt JSON</a>
+        </div>
+        <p>@@RECEIPT_STATEMENT@@</p>
+        <p class="caption">SHA-256 of analysis only: canonical UTF-8 JSON, sorted keys, compact separators, ASCII escapes. The receipt contains the full analysis, including every supplied scenario.</p>
+        <p class="fingerprint"><code>@@FINGERPRINT@@</code></p>
+        <p id="download-status" class="caption" role="status" aria-live="polite"></p>
+      </section>
+    </main>
+    <footer><p>repo-ready / Field notes, not a runtime guarantee.</p><p>Self-contained · No remote resources</p></footer>
+  </div>
+  <script id="report-payload" type="application/json">@@PAYLOAD@@</script>
+  <script id="report-receipt" type="application/json">@@RECEIPT_JSON@@</script>
+  <script id="report-controller">@@SCRIPT@@</script>
+</body>
+</html>

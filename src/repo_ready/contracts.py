@@ -9,8 +9,11 @@ provided by :class:`~repo_ready.context.RepoContext`.
 
 from __future__ import annotations
 
+import fnmatch
 import json
+import posixpath
 import re
+import shlex
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,8 +22,10 @@ from typing import Iterable, Literal
 from .checks import (
     _docker_image,
     _dockerfile_instructions,
+    _lock_paths,
     _root_dockerfile,
     _text,
+    _validate_lock,
 )
 from .context import RepoContext
 from .detector import detect_ecosystems
@@ -282,6 +287,7 @@ def _collect_readme(context: RepoContext, evidence: list[Evidence]) -> None:
                 runtime = _runtime_version(stripped, node="node" in stripped.casefold())
                 if runtime:
                     ecosystem = "node" if "node" in stripped.casefold() else "python"
+                    declaration = re.search(r"(?i)\b(?:python|node(?:\.js)?)\b\s*:?\s*(.+)", stripped)
                     _add_evidence(
                         evidence,
                         kind="runtime",
@@ -290,7 +296,10 @@ def _collect_readme(context: RepoContext, evidence: list[Evidence]) -> None:
                         line=number,
                         value=stripped,
                         normalized=runtime,
-                        attributes=_attrs(ecosystem=ecosystem, source="readme"),
+                        attributes=_attrs(
+                            ecosystem=ecosystem, source="readme",
+                            constraint=declaration.group(1).strip().strip("`*") if declaration else None,
+                        ),
                     )
 
 
@@ -503,43 +512,57 @@ def _collect_workflows(context: RepoContext, evidence: list[Evidence]) -> None:
         lines = text.splitlines()
         in_run_block = False
         run_indent = 0
+        steps_indent: int | None = None
+        step_indent: int | None = None
+        field_indent: int | None = None
         for number, line in enumerate(lines, 1):
             stripped = line.strip()
             indent = len(line) - len(line.lstrip())
-            setup_python = re.search(r"python-version:\s*[\"']?([^\"'\s]+)", line)
+            if re.fullmatch(r"steps:\s*(?:#.*)?", stripped):
+                steps_indent, step_indent, field_indent = indent, None, None
+            elif stripped and not stripped.startswith("#") and steps_indent is not None:
+                if indent < steps_indent or (indent == steps_indent and not stripped.startswith("- ")):
+                    steps_indent, step_indent, field_indent = None, None, None
+                elif stripped.startswith("- ") and (step_indent is None or indent <= step_indent):
+                    step_indent = indent
+                    field_indent = indent + len(stripped) - len(stripped[1:].lstrip())
+            setup_python = re.match(r"^\s*(?:-\s+)?python-version:\s*(.+?)\s*$", line)
             if setup_python:
+                value = setup_python.group(1).split(" #", 1)[0].strip().strip("\"'")
                 _add_evidence(
                     evidence,
                     kind="runtime",
                     subject="ci-python",
                     file=entry.path,
                     line=number,
-                    value=setup_python.group(1),
-                    normalized=_runtime_version(setup_python.group(1)) or setup_python.group(1),
-                    attributes=_attrs(ecosystem="python", source="workflow", role="ci"),
+                    value=value,
+                    normalized=_runtime_version(value) or value,
+                    attributes=_attrs(ecosystem="python", source="workflow", role="ci", constraint=value),
                 )
-            setup_node = re.search(r"node-version:\s*[\"']?([^\"'\s]+)", line)
+            setup_node = re.match(r"^\s*(?:-\s+)?node-version:\s*(.+?)\s*$", line)
             if setup_node:
+                value = setup_node.group(1).split(" #", 1)[0].strip().strip("\"'")
                 _add_evidence(
                     evidence,
                     kind="runtime",
                     subject="ci-node",
                     file=entry.path,
                     line=number,
-                    value=setup_node.group(1),
-                    normalized=_runtime_version(setup_node.group(1), node=True) or setup_node.group(1),
-                    attributes=_attrs(ecosystem="node", source="workflow", role="ci"),
+                    value=value,
+                    normalized=_runtime_version(value, node=True) or value,
+                    attributes=_attrs(ecosystem="node", source="workflow", role="ci", constraint=value),
                 )
-            if re.match(r"^\s*run:\s*\|", line):
+            run = re.match(r"^\s*(?:-\s+)?run:\s*(.*?)\s*$", line)
+            if steps_indent is None or field_indent is None or line.find("run:") != field_indent:
+                run = None
+            if run and re.fullmatch(r"[|>][+-]?(?:\s+#.*)?", run.group(1)):
                 in_run_block = True
-                run_indent = indent
+                run_indent = line.index("run:")
                 continue
             if in_run_block and line.strip() and indent <= run_indent:
                 in_run_block = False
-            candidate = stripped
-            if candidate.startswith("run:"):
-                candidate = candidate[4:].strip()
-            if in_run_block or candidate:
+            candidate = run.group(1).strip().strip("\"'") if run else stripped
+            if in_run_block or run:
                 command = _command_from_line(candidate)
                 if command:
                     family, value = command
@@ -589,7 +612,15 @@ def _collect_docker(context: RepoContext, evidence: list[Evidence]) -> None:
                     attributes=_attrs(ecosystem=ecosystem, image=image, stage="final" if index == final_from else "build"),
                 )
         if instruction in {"CMD", "ENTRYPOINT"} and index > final_from:
-            command = _command_from_line(body.strip("[]\"'"))
+            if body.lstrip().startswith("["):
+                try:
+                    argv = json.loads(body)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(argv, list) or not argv or not all(isinstance(arg, str) for arg in argv):
+                    continue
+                body = shlex.join(argv)
+            command = _command_from_line(body)
             if command:
                 family, value = command
                 _add_evidence(
@@ -610,6 +641,7 @@ def _collect_docker(context: RepoContext, evidence: list[Evidence]) -> None:
         if not match:
             continue
         instruction, body = match.groups()
+        instruction = instruction.upper()
         if instruction == "RUN":
             command = _command_from_line(body)
             if command:
@@ -636,20 +668,26 @@ def _collect_docker(context: RepoContext, evidence: list[Evidence]) -> None:
                     attributes=_attrs(source="docker", family="install"),
                 )
         else:
-            parts = body.split()
-            if len(parts) >= 2:
-                source = parts[-2]
-                if not source.startswith(("--", "<<")):
-                    _add_evidence(
-                        evidence,
-                        kind="container",
-                        subject="docker-copy",
-                        file=path,
-                        line=number,
-                        value=source,
-                        normalized=source,
-                        attributes=_attrs(source="docker", instruction=instruction),
-                    )
+            flags = re.match(r"^(?:(--\S+)\s+)*", body)
+            options = flags.group(0) if flags else ""
+            body = body[len(options):]
+            try:
+                parts = json.loads(body) if body.startswith("[") else shlex.split(body)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(parts, list) and len(parts) >= 2 and all(isinstance(part, str) for part in parts):
+                for index, source in enumerate(parts[:-1]):
+                    if not source.startswith(("--", "<<")):
+                        _add_evidence(
+                            evidence,
+                            kind="container",
+                            subject="docker-copy" if len(parts) == 2 else f"docker-copy:{index}",
+                            file=path,
+                            line=number,
+                            value=source,
+                            normalized=source,
+                            attributes=_attrs(source="docker", instruction=instruction, external="--from=" in options),
+                        )
 
 
 def _collect_locks(context: RepoContext, evidence: list[Evidence]) -> None:
@@ -657,9 +695,9 @@ def _collect_locks(context: RepoContext, evidence: list[Evidence]) -> None:
         "uv.lock", "poetry.lock", "Pipfile.lock", "pdm.lock", "package-lock.json",
         "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml",
     )
-    for name in names:
+    for name in dict.fromkeys((*names, *_lock_paths(context, "python"), *_lock_paths(context, "node"))):
         entry = context.entry(name)
-        if entry is not None and entry.readable:
+        if entry is not None:
             _add_evidence(
                 evidence,
                 kind="lockfile",
@@ -871,26 +909,77 @@ def _link_commands(
             )
 
 
-def _compatible_runtime(pin: Evidence, candidate: Evidence) -> bool | None:
-    if pin.normalized == candidate.normalized:
-        return True
-    constraint = dict(candidate.attributes).get("constraint", "")
-    version = pin.normalized
-    if constraint.startswith(">="):
-        try:
-            return tuple(int(part) for part in version.split(".")) >= tuple(int(part) for part in constraint[2:].split("."))
-        except ValueError:
-            return None
-    if constraint.startswith("^"):
-        try:
-            lower = tuple(int(part) for part in constraint[1:].split("."))
-            current = tuple(int(part) for part in version.split("."))
-            return current >= lower and current[0] == lower[0]
-        except ValueError:
-            return None
-    if constraint and any(character in constraint for character in "<>=~|* "):
+def _numeric_version(value: str) -> tuple[int, ...] | None:
+    if not re.fullmatch(r"v?\d+(?:\.\d+){0,2}", value):
         return None
-    return False
+    return tuple(int(part) for part in value.lstrip("v").split("."))
+
+
+def _version_prefix(parts: tuple[int, ...]) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """A minor/major pin denotes its prefix; a patch pin denotes one release."""
+
+    lower = parts + (0,) * (3 - len(parts))
+    upper = (*parts[:-1], parts[-1] + 1) + (0,) * (3 - len(parts))
+    return lower, upper
+
+
+def _runtime_interval(value: str, *, node: bool) -> tuple[tuple[int, ...], tuple[int, ...] | None] | None:
+    """Parse only numeric conjunctions and Node carets, never a partial range."""
+
+    value = value.strip()
+    if parts := _numeric_version(value):
+        return _version_prefix(parts)
+    if node and value.startswith("^"):
+        parts = _numeric_version(value[1:])
+        if parts is None:
+            return None
+        index = next((index for index, part in enumerate(parts) if part), len(parts) - 1)
+        lower = parts + (0,) * (3 - len(parts))
+        upper = (*parts[:index], parts[index] + 1) + (0,) * (2 - index)
+        return lower, upper
+    # Reject unions, exclusions, wildcards, prereleases and arbitrary suffixes.
+    token = r"(>=|<=|==|>|<|=)\s*(\d+(?:\.\d+){0,2})"
+    if not re.fullmatch(rf"{token}(?:(?:\s*,\s*|\s+){token})*", value):
+        return None
+    lower = (0, 0, 0)
+    upper = None
+    for operator, version in re.findall(token, value):
+        parts = _numeric_version(version)
+        assert parts is not None
+        point = parts + (0,) * (3 - len(parts))
+        following = (*point[:2], point[2] + 1)
+        if node and len(parts) < 3:
+            following = _version_prefix(parts)[1]
+        if operator in {">", ">=", "=", "=="}:
+            lower = max(lower, following if operator == ">" else point)
+        if operator in {"<", "<=", "=", "=="}:
+            bound = point if operator == "<" else following
+            upper = min(upper, bound) if upper is not None else bound
+    return (lower, upper) if upper is None or lower < upper else None
+
+
+def _compatible_runtime(pin: Evidence, candidate: Evidence) -> bool | None:
+    parts = _numeric_version(pin.normalized)
+    if parts is None:
+        return None
+    attrs = dict(candidate.attributes)
+    constraint = attrs.get("constraint")
+    if constraint is not None:
+        constraint = constraint.strip()
+    if constraint is None or _numeric_version(constraint):
+        other = _numeric_version(candidate.normalized if constraint is None else constraint)
+        return parts[:min(len(parts), len(other))] == other[:min(len(parts), len(other))] if other else None
+    interval = _runtime_interval(constraint, node=attrs.get("ecosystem") == "node")
+    if interval is None:
+        return None
+    low, high = _version_prefix(parts)
+    required_low, required_high = interval
+    if high <= required_low or (required_high is not None and low >= required_high):
+        return False
+    if low >= required_low and (required_high is None or high <= required_high):
+        return True
+    # An unresolved patch may fall on either side of a bound.
+    return None
 
 
 def _commands_match(source: Evidence, target: Evidence) -> bool:
@@ -947,29 +1036,37 @@ def _link_dependencies(
     diagnostics: list[ContractDiagnostic],
 ) -> None:
     locks = [item for item in evidence if item.kind == "lockfile"]
+    selected = {ecosystem: _lock_paths(context, ecosystem) for ecosystem in ("python", "node")}
+    validation: dict[tuple[str, str], tuple[bool, str]] = {}
     for dependency in (item for item in evidence if item.kind == "dependency"):
         attrs = dict(dependency.attributes)
         ecosystem = attrs.get("ecosystem")
-        if ecosystem == "node":
-            candidates = [item for item in locks if item.file in {"package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml"}]
-        elif ecosystem == "python":
-            candidates = [item for item in locks if item.file in {"uv.lock", "poetry.lock", "Pipfile.lock", "pdm.lock"}]
-        else:
-            candidates = []
+        candidates = [item for path in selected.get(ecosystem, ()) for item in locks if item.file == path]
         if not candidates:
             continue
-        lock = candidates[0]
-        text = context.read_text(lock.file) or ""
-        covered = dependency.normalized in text.casefold()
+        outcomes: list[tuple[ContractStatus, Evidence, str]] = []
+        for lock in candidates:
+            key = (ecosystem, lock.file)
+            if key not in validation:
+                validation[key] = _validate_lock(context, lock.file, ecosystem, set())
+            valid, detail = validation[key]
+            status: ContractStatus = "unknown"
+            if valid:
+                name = dependency.normalized if ecosystem == "python" else attrs.get("name", dependency.normalized)
+                covered, detail = _validate_lock(context, lock.file, ecosystem, {name})
+                status = "satisfied" if covered else "mismatch"
+            outcomes.append((status, lock, detail))
+        # Requirements files can split dependency groups across several files.
+        status, lock, detail = min(outcomes, key=lambda item: {"satisfied": 0, "unknown": 1, "mismatch": 2}[item[0]])
         edge = _edge(
             edges,
             relation="covers",
             source=dependency,
             target=lock,
-            status="satisfied" if covered else "mismatch",
+            status=status,
             expected=dependency.normalized,
             actual=lock.file,
-            detail="Manifest dependency compared with the selected lockfile text.",
+            detail=detail or "Declared dependency name is covered by the selected structured lockfile.",
         )
         if edge.status == "mismatch":
             _diagnostic(
@@ -983,12 +1080,32 @@ def _link_dependencies(
 
     install_commands = [item for item in evidence if item.subject in {"ci-install", "docker-install", "make-install"}]
     for command in install_commands:
-        for referenced in re.findall(r"(?:-r|--requirement|--lockfile)\s+([^\s]+)|\b(package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|uv\.lock|poetry\.lock|Pipfile\.lock|pdm\.lock)\b", command.value):
-            path = next((value for value in referenced if value), "")
-            if not path:
-                continue
+        try:
+            tokens = shlex.split(command.value)
+        except ValueError:
+            continue
+        references: set[str] = set()
+        for index, token in enumerate(tokens):
+            if token in {"-r", "--requirement", "--lockfile"} and index + 1 < len(tokens):
+                references.add(tokens[index + 1])
+            elif token.startswith(("--requirement=", "--lockfile=")):
+                references.add(token.split("=", 1)[1])
+            elif token.startswith("-r") and len(token) > 2:
+                references.add(token[2:])
+            elif token in {"package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "uv.lock", "poetry.lock", "Pipfile.lock", "pdm.lock"}:
+                references.add(token)
+        for path in sorted(references):
+            path = posixpath.normpath(path)
             target = next((item for item in locks if item.file == path), None)
-            status: ContractStatus = "satisfied" if target else "missing"
+            uncertain = path.startswith(("/", "../")) or path == ".." or any(char in path for char in "$*?{}:")
+            entry = None if uncertain else context.entry(path)
+            readable = entry is not None and context.read_text(entry) is not None
+            if readable and target is None:
+                target = _add_evidence(
+                    evidence, kind="artifact", subject="dependency-file", file=path,
+                    line=1, value=path, attributes=_attrs(source="filesystem"),
+                )
+            status = "satisfied" if readable else "unknown" if uncertain or entry is not None or context.truncated else "missing"
             _edge(
                 edges,
                 relation="references",
@@ -996,10 +1113,10 @@ def _link_dependencies(
                 target=target,
                 status=status,
                 expected=path,
-                actual=target.file if target else None,
-                detail="Install command reference compared with repository lockfiles.",
+                actual=path if readable else None,
+                detail="Install command reference compared with readable indexed repository files.",
             )
-            if target is None:
+            if status == "missing":
                 _diagnostic(
                     diagnostics,
                     code="CG008" if command.subject.startswith("docker") else "CG007",
@@ -1011,22 +1128,33 @@ def _link_dependencies(
 
 
 def _link_copies(context: RepoContext, evidence: list[Evidence], edges: list[ContractEdge], diagnostics: list[ContractDiagnostic]) -> None:
-    for item in (entry for entry in evidence if entry.subject == "docker-copy"):
-        source = item.value.strip().lstrip("./")
-        if source in {"", "."}:
+    for item in (entry for entry in evidence if entry.subject.startswith("docker-copy")):
+        source = posixpath.normpath(item.value.strip())
+        if source == ".":
             continue
-        target = context.entry(source)
+        uncertain = (
+            dict(item.attributes).get("external") == "True"
+            or source.startswith(("/", "../")) or source == ".."
+            or any(character in source for character in "$:{}")
+        )
+        parts = source.split("/")
+        present = not uncertain and any(
+            len(entry.path.split("/")) >= len(parts)
+            and all(fnmatch.fnmatchcase(part, pattern) for part, pattern in zip(entry.path.split("/"), parts))
+            for entry in context
+        )
+        status: ContractStatus = "satisfied" if present else "unknown" if uncertain or context.truncated else "missing"
         _edge(
             edges,
             relation="references",
             source=item,
             target=None,
-            status="satisfied" if target else "missing",
+            status=status,
             expected=source,
-            actual=source if target else None,
+            actual=source if present else None,
             detail="Docker COPY/ADD source compared with the repository file index.",
         )
-        if target is None:
+        if status == "missing":
             _diagnostic(
                 diagnostics,
                 code="CG014",

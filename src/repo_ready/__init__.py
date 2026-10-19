@@ -3,6 +3,7 @@
 __version__ = "0.1.0"
 
 from .context import ConfigError, FileEntry, RepoContext
+from .overlay import OverlayContext, SnapshotContext, snapshot_context
 from .contracts import ContractDiagnostic, ContractEdge, ContractGraph, Evidence, diagnose
 from .baseline import ReportComparison, compare_reports, compare_repository
 from .artifact import ArtifactFinding, ArtifactMember, ArtifactReport, inspect_artifact
@@ -10,6 +11,8 @@ from .tracked import TrackedFile, TrackedReport, inspect_tracked
 from .registry import RuleDescriptor, rule_descriptors
 from .models import CheckResult, Finding, ScanReport
 from .scoring import build_report, report, scan, scan_repository
+from .showcase import SHOWCASE_SCHEMA_VERSION, analysis_fingerprint, build_showcase
+from .showcase_html import render_showcase
 
 __all__ = [
     "CheckResult",
@@ -22,13 +25,18 @@ __all__ = [
     "ContractGraph",
     "Evidence",
     "FileEntry",
+    "OverlayContext",
     "Finding",
     "ReportComparison",
     "RepoContext",
+    "SnapshotContext",
     "ScanReport",
+    "SHOWCASE_SCHEMA_VERSION",
     "build_report",
     "compare_reports",
     "compare_repository",
+    "analysis_fingerprint",
+    "build_showcase",
     "diagnose",
     "inspect_artifact",
     "TrackedFile",
@@ -37,6 +45,8 @@ __all__ = [
     "RuleDescriptor",
     "rule_descriptors",
     "report",
+    "render_showcase",
     "scan",
     "scan_repository",
+    "snapshot_context",
 ]

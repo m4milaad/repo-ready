@@ -6,5 +6,7 @@ __pycache__/
 dist/
 build/
 .coverage
+repo-report.html
+showcase-payload.json
 node_modules/
 .env

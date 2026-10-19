@@ -182,6 +182,39 @@ def _plan(root: Path, relative: str, content: str, reason: str) -> PlannedFile:
     return _target_operation(root, relative, content, reason)
 
 
+def _context_plan(
+    context: RepoContext,
+    root: Path,
+    relative: str,
+    content: str,
+    reason: str,
+) -> PlannedFile:
+    """Plan an operation from an immutable context without touching disk.
+
+    The ordinary planner retains its filesystem guards because it can be
+    applied to a live repository.  Showcase previews instead operate on a
+    :class:`RepoContext` snapshot, where indexed presence is the only safe
+    existence fact available.  This keeps preview planning inside the same
+    fixer decisions while making the no-reread boundary explicit.
+    """
+
+    try:
+        pure = PurePosixPath(relative)
+        target = root.joinpath(*pure.parts)
+    except (TypeError, ValueError):
+        return PlannedFile(root, content, f"{reason}; invalid target path.", "skip-unsafe")
+    if pure.is_absolute() or ".." in pure.parts or not pure.parts:
+        return PlannedFile(target, content, f"{reason}; target escapes the repository root.", "skip-unsafe")
+    if context.entry(relative) is not None:
+        return PlannedFile(
+            target,
+            content,
+            f"{reason}; target already exists and will not be overwritten.",
+            "skip-existing",
+        )
+    return PlannedFile(target, content, reason, "create")
+
+
 def _toml(context: RepoContext, relative: str) -> dict[str, object] | None:
     text = context.read_text(relative)
     if text is None:
@@ -261,6 +294,7 @@ def plan_fixes(
     license_name: str | None = None,
     holder: str | None = None,
     runtime_version: str | None = None,
+    context: RepoContext | None = None,
 ) -> list[PlannedFile]:
     """Return deterministic create, skip, and manual operations for *root*.
 
@@ -269,15 +303,27 @@ def plan_fixes(
     paths remain explicit ``manual`` entries.
     """
 
-    trusted = _trusted_root(root)
-    if trusted is None:
-        return []
-    context = RepoContext(trusted)
+    context_is_live = context is None
+    if context is None:
+        trusted = _trusted_root(root)
+        if trusted is None:
+            return []
+        context = RepoContext(trusted)
+    else:
+        if not isinstance(context, RepoContext):
+            raise TypeError("context must be a RepoContext")
+        # A frozen context carries the root identity without checking the live
+        # filesystem.  Showcase callers use this branch after snapshotting.
+        trusted = context.root
     ecosystems = detect_ecosystems(context)
     plans: list[PlannedFile] = []
 
     def add(relative: str, content: str, reason: str) -> None:
-        plans.append(_plan(trusted, relative, content, reason))
+        plans.append(
+            _plan(trusted, relative, content, reason)
+            if context_is_live
+            else _context_plan(context, trusted, relative, content, reason)
+        )
 
     def skip_existing(relative: str, reason: str) -> bool:
         if (entry := context.entry(relative)) is not None:
@@ -290,6 +336,8 @@ def plan_fixes(
                 )
             )
             return True
+        if not context_is_live:
+            return False
         candidate = trusted / relative
         try:
             if candidate.is_symlink():
@@ -310,7 +358,7 @@ def plan_fixes(
         existing = next((name for name in names if context.entry(name) is not None), None)
         if existing is not None:
             skip_existing(existing, reason)
-        elif any((trusted / name).is_symlink() for name in names):
+        elif context_is_live and any((trusted / name).is_symlink() for name in names):
             existing = next(name for name in names if (trusted / name).is_symlink())
             skip_existing(existing, reason)
         else:

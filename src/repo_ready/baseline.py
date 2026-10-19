@@ -12,11 +12,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
+from .context import RepoContext
 from .scoring import report
 
 
 BASELINE_SCHEMA_VERSION = 1
 _REQUIRED_REPORT_KEYS = {"tool", "version", "path", "ecosystems", "score", "max", "grade", "checks"}
+_REQUIRED_CHECK_KEYS = {"id", "title", "weight", "earned", "status", "message", "fix_hint", "fixable", "findings"}
+_STATUS_RANK = {"fail": 0, "partial": 1, "pass": 2, "na": 2}
 
 
 class BaselineError(ValueError):
@@ -72,23 +75,68 @@ class ReportComparison:
 
 
 def _as_report(value: Mapping[str, object], label: str) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise BaselineError(f"{label} must contain a report object")
     missing = sorted(_REQUIRED_REPORT_KEYS - set(value))
     if missing:
         raise BaselineError(f"{label} is missing report keys: {', '.join(missing)}")
     if value.get("tool") != "repo-ready":
         raise BaselineError(f"{label} was not produced by repo-ready")
-    if not isinstance(value.get("score"), int) or not isinstance(value.get("max"), int):
+    if (
+        type(value["score"]) is not int or type(value["max"]) is not int
+        or not 0 <= value["score"] <= value["max"] or value["max"] <= 0
+    ):
         raise BaselineError(f"{label} has invalid score metadata")
+    if (
+        any(not isinstance(value[key], str) for key in ("version", "path", "grade"))
+        or not isinstance(value["ecosystems"], list)
+        or any(not isinstance(item, str) for item in value["ecosystems"])
+    ):
+        raise BaselineError(f"{label} has invalid report metadata")
     checks = value.get("checks")
-    if not isinstance(checks, list) or any(not isinstance(item, dict) or "id" not in item for item in checks):
+    if not isinstance(checks, list):
         raise BaselineError(f"{label} has an invalid checks collection")
+    identifiers: set[str] = set()
+    for check in checks:
+        if not isinstance(check, dict) or not _REQUIRED_CHECK_KEYS.issubset(check):
+            raise BaselineError(f"{label} has an invalid check record")
+        identifier = check["id"]
+        if not isinstance(identifier, str) or not identifier.strip():
+            raise BaselineError(f"{label} has an invalid check id")
+        if identifier in identifiers:
+            raise BaselineError(f"{label} has duplicate check id {identifier!r}")
+        identifiers.add(identifier)
+        if (
+            type(check["earned"]) is not int or type(check["weight"]) is not int
+            or not 0 <= check["earned"] <= check["weight"]
+            or not isinstance(check["status"], str) or check["status"] not in _STATUS_RANK
+            or any(not isinstance(check[key], str) for key in ("title", "message"))
+            or (check["fix_hint"] is not None and not isinstance(check["fix_hint"], str))
+            or not isinstance(check["fixable"], bool)
+            or not isinstance(check["findings"], list)
+        ):
+            raise BaselineError(f"{label} has invalid data for check {identifier}")
+        for finding in check["findings"]:
+            if (
+                not isinstance(finding, dict) or not {"file", "line", "detail"}.issubset(finding)
+                or not isinstance(finding["file"], str) or not isinstance(finding["detail"], str)
+                or (finding["line"] is not None and (type(finding["line"]) is not int or finding["line"] < 1))
+            ):
+                raise BaselineError(f"{label} has an invalid finding for check {identifier}")
     return dict(value)
 
 
 def _check_map(report_value: Mapping[str, object]) -> dict[str, dict[str, object]]:
     checks = report_value["checks"]
     assert isinstance(checks, list)
-    return {str(item["id"]): item for item in checks if isinstance(item, dict)}
+    return {item["id"]: item for item in checks}
+
+
+def _finding_map(check: dict[str, object]) -> dict[tuple[str, int | None, str], dict[str, object]]:
+    return {
+        (item["file"], item["line"], item["detail"]): {key: item[key] for key in ("file", "line", "detail")}
+        for item in check["findings"]
+    }
 
 
 def _direction(before: object, after: object) -> str:
@@ -104,11 +152,8 @@ def _direction(before: object, after: object) -> str:
 
 
 def _field_direction(field: str, before: object, after: object) -> str:
-    if field == "findings" and isinstance(before, list) and isinstance(after, list):
-        if len(after) > len(before):
-            return "regression"
-        if len(after) < len(before):
-            return "improvement"
+    if field == "status" and _STATUS_RANK[before] != _STATUS_RANK[after]:
+        return _direction(_STATUS_RANK[before], _STATUS_RANK[after])
     return _direction(before, after)
 
 
@@ -140,7 +185,7 @@ def compare_reports(baseline: Mapping[str, object], current: Mapping[str, object
         old = before_checks.get(identifier)
         new = after_checks.get(identifier)
         if old is None or new is None:
-            direction = "improvement" if new is not None else "regression"
+            direction = "regression" if new is None or new["status"] in {"fail", "partial"} or new["findings"] else "improvement"
             changes.append(
                 ReportChange(
                     "check",
@@ -165,7 +210,7 @@ def compare_reports(baseline: Mapping[str, object], current: Mapping[str, object
                     new_earned,
                 )
             )
-        for field in ("status", "message", "findings"):
+        for field in ("status", "message"):
             if old.get(field) != new.get(field):
                 changes.append(
                     ReportChange(
@@ -175,6 +220,24 @@ def compare_reports(baseline: Mapping[str, object], current: Mapping[str, object
                         f"{identifier} {field} changed.",
                         old.get(field),
                         new.get(field),
+                    )
+                )
+
+        old_findings, new_findings = _finding_map(old), _finding_map(new)
+        for direction, selected, other in (
+            ("regression", new_findings, old_findings),
+            ("improvement", old_findings, new_findings),
+        ):
+            keys = selected.keys() - other.keys()
+            if keys:
+                findings = [selected[key] for key in sorted(keys, key=lambda key: (key[0], key[1] or 0, key[2]))]
+                added = direction == "regression"
+                changes.append(
+                    ReportChange(
+                        "check-findings", identifier, direction,
+                        f"{identifier} findings {'added' if added else 'resolved'}.",
+                        [] if added else findings,
+                        findings if added else [],
                     )
                 )
 
@@ -194,7 +257,7 @@ def load_report(path: str | Path) -> dict[str, object]:
     candidate = Path(path)
     try:
         text = candidate.read_text(encoding="utf-8")
-    except OSError as error:
+    except (OSError, UnicodeError) as error:
         raise BaselineError(f"could not read baseline {candidate}: {error}") from error
     try:
         value = json.loads(text)
@@ -205,8 +268,20 @@ def load_report(path: str | Path) -> dict[str, object]:
     return _as_report(value, f"baseline {candidate}")
 
 
-def compare_repository(root: str | Path, baseline_path: str | Path) -> ReportComparison:
-    return compare_reports(load_report(baseline_path), report(root))
+def compare_repository(
+    root: str | Path,
+    baseline_path: str | Path,
+    *,
+    context: RepoContext | None = None,
+) -> ReportComparison:
+    """Compare a repository report, optionally through a read-only context.
+
+    The optional context is useful for deterministic what-if views.  The
+    baseline file is still read once from the caller-supplied path, while all
+    current-repository reads go through ``context`` when supplied.
+    """
+
+    return compare_reports(load_report(baseline_path), report(root, context=context))
 
 
 __all__ = [

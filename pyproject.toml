@@ -28,3 +28,6 @@ repo-ready = "repo_ready.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+repo_ready = ["showcase_assets/*.html", "showcase_assets/*.css", "showcase_assets/*.js"]

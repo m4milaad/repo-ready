@@ -741,3 +741,45 @@ def test_offline_socket_guard_canary() -> None:
 def test_offline_subprocess_guard_canary() -> None:
     with pytest.raises(AssertionError):
         subprocess.Popen([os.fspath(Path("not-a-real-command"))])
+
+
+def test_showcase_writes_a_self_contained_report_without_touching_repository(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repository = copy_fixture(tmp_path, "python-bad")
+    before = {
+        path.relative_to(repository).as_posix(): path.read_bytes()
+        for path in repository.rglob("*")
+        if path.is_file()
+    }
+    output = tmp_path / "report.html"
+
+    assert main(["showcase", str(repository), "--output", str(output)]) == 0
+
+    captured = capsys.readouterr()
+    assert "Wrote offline showcase report" in captured.out
+    document = output.read_text(encoding="utf-8")
+    assert "Engineering Field Notes" in document
+    assert "report-payload" in document
+    assert {
+        path.relative_to(repository).as_posix(): path.read_bytes()
+        for path in repository.rglob("*")
+        if path.is_file()
+    } == before
+
+
+def test_showcase_json_mode_emits_payload_and_does_not_write_default_html(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = copy_fixture(tmp_path, "empty-repo")
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["showcase", str(repository), "--json", "--no-scenarios"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["schema_version"] == 1
+    assert payload["analysis"]["scenarios"] == []
+    assert not (tmp_path / "repo-report.html").exists()

@@ -9,7 +9,17 @@ configuration files without overwriting anything.
 ## Live demo
 
 This project is a local CLI, so it has no hosted web demo. The reproducible
-Docker test run below is the judge-facing demo:
+offline showcase below is the judge-facing demo. It uses the checked-in
+`python-bad` fixture, so it also demonstrates a repository with evidence worth
+following:
+
+```sh
+repo-ready showcase tests/fixtures/python-bad/repo --output repo-report.html
+```
+
+Open `repo-report.html` directly in a browser, select a Breakage Lab scenario,
+then inspect its evidence chain and Repair Preview. The Docker test run remains
+the clean-room verification:
 
 ```sh
 docker build -t repo-ready .
@@ -129,6 +139,32 @@ The stable readiness rule registry is also available for integrations:
 ```sh
 repo-ready rules --json
 ```
+
+### Repo X-Ray showcase
+
+Generate a single, self-contained HTML report for an offline review. The
+report contains the static readiness score, cross-file evidence graph,
+precomputed Breakage Lab scenarios, create-only Repair Preview, and a
+downloadable JSON evidence receipt. It never executes target code, invokes a
+package manager, or writes the inspected repository.
+
+```sh
+repo-ready showcase . --output repo-report.html
+```
+
+Open `repo-report.html` directly from disk. It has no server, CDN, account, or
+internet dependency. Scenario views are explicitly labelled `Simulated`; an
+unavailable scenario explains which contract was not observed. To inspect the
+JSON payload in a pipeline without writing HTML:
+
+```sh
+repo-ready showcase . --scope tracked --json > showcase-payload.json
+```
+
+The evidence receipt fingerprint is a deterministic SHA-256 of the canonical
+static analysis, including its scenarios. It identifies the supplied evidence
+snapshot; it is not a security certification and does not prove that the
+repository builds.
 
 ### Release artifact inspection
 

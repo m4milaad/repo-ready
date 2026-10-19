@@ -19,6 +19,8 @@ from .formats import render_markdown, render_sarif
 from .tracked import inspect_tracked
 from .registry import rule_descriptors
 from .scoring import report
+from .showcase import build_showcase
+from .showcase_html import render_showcase
 
 
 _ANSI_RESET = "\033[0m"
@@ -72,6 +74,20 @@ def _parser() -> argparse.ArgumentParser:
     fix.add_argument("--runtime-version", default=None)
     fix.add_argument("--json", action="store_true", dest="as_json")
     fix.add_argument("--format", choices=("text", "json", "diff"), default=None)
+
+    showcase = commands.add_parser(
+        "showcase",
+        help="write a self-contained offline Repo X-Ray report",
+    )
+    showcase.add_argument("path", nargs="?", type=Path, default=None)
+    showcase.add_argument(
+        "--output", "-o", type=Path, default=Path("repo-report.html"),
+        help="HTML report destination (default: ./repo-report.html)",
+    )
+    showcase.add_argument("--scope", choices=("filesystem", "tracked"), default="filesystem")
+    showcase.add_argument("--no-scenarios", action="store_true")
+    showcase.add_argument("--json", action="store_true", dest="as_json",
+                          help="print the computed payload instead of writing HTML")
     return parser
 
 
@@ -281,6 +297,20 @@ def _run_fix(args: argparse.Namespace, repository: Path) -> int:
     return 0
 
 
+def _run_showcase(args: argparse.Namespace, repository: Path) -> int:
+    payload = build_showcase(repository, scope=args.scope, scenarios=not args.no_scenarios)
+    if args.as_json:
+        print(json.dumps(payload, indent=2, ensure_ascii=True, sort_keys=True))
+        return 0
+    document = render_showcase(payload)
+    destination = args.output.expanduser()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(document, encoding="utf-8", newline="\n")
+    print(f"Wrote offline showcase report: {destination}")
+    print(f"Evidence fingerprint: {payload['receipt']['fingerprint']}")
+    return 0
+
+
 def _fix_item(operation: PlannedFile, repository: Path) -> dict[str, str]:
     return operation.as_dict(repository)
 
@@ -388,6 +418,18 @@ def main(argv: list[str] | None = None) -> int:
             return 2
     if args.command == "rules":
         return _run_rules(args)
+    if args.command == "showcase" and args.as_json:
+        # JSON mode still validates the repository path, but deliberately does
+        # not write the requested HTML destination.
+        repository = _resolve_repository(supplied_path)
+        if repository is None:
+            print(f"repo-ready: repository path is not a directory or is unreadable: {supplied_path}", file=sys.stderr)
+            return 2
+        try:
+            return _run_showcase(args, repository)
+        except (ConfigError, OSError, ValueError) as error:
+            print(f"repo-ready: showcase error: {error}", file=sys.stderr)
+            return 2
     repository = _resolve_repository(supplied_path)
     if repository is None:
         print(f"repo-ready: repository path is not a directory or is unreadable: {supplied_path}", file=sys.stderr)
@@ -405,12 +447,18 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "tracked":
             args.path = supplied_path
             return _run_tracked(args, repository)
+        if args.command == "showcase":
+            args.path = supplied_path
+            return _run_showcase(args, repository)
         return _run_fix(args, repository)
     except ConfigError as error:
         print(f"repo-ready: configuration error: {error}", file=sys.stderr)
         return 2
     except BaselineError as error:
         print(f"repo-ready: baseline error: {error}", file=sys.stderr)
+        return 2
+    except (OSError, ValueError) as error:
+        print(f"repo-ready: error: {error}", file=sys.stderr)
         return 2
 
 
