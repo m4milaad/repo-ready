@@ -97,6 +97,21 @@ The graph has its own versioned schema with `evidence`, `edges`, and
 `diagnostics` collections. A diagnostic is static evidence, not proof that a
 command succeeds when executed.
 
+### Baseline comparison
+
+Compare a current report with a previously saved `check --json` report. The
+comparison ignores checkout paths and reports check-level changes even when
+the total score is unchanged:
+
+```sh
+repo-ready check . --json > readiness-before.json
+repo-ready compare . --baseline readiness-before.json --json
+```
+
+The comparison output has its own versioned schema. It exits `1` when the
+score or check evidence regresses, `0` when there is no regression, and `2`
+when the baseline is missing or invalid.
+
 ### Exit codes
 
 | Code | Meaning |

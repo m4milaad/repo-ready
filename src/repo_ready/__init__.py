@@ -4,6 +4,7 @@ __version__ = "0.1.0"
 
 from .context import ConfigError, FileEntry, RepoContext
 from .contracts import ContractDiagnostic, ContractEdge, ContractGraph, Evidence, diagnose
+from .baseline import ReportComparison, compare_reports, compare_repository
 from .models import CheckResult, Finding, ScanReport
 from .scoring import build_report, report, scan, scan_repository
 
@@ -16,9 +17,12 @@ __all__ = [
     "Evidence",
     "FileEntry",
     "Finding",
+    "ReportComparison",
     "RepoContext",
     "ScanReport",
     "build_report",
+    "compare_reports",
+    "compare_repository",
     "diagnose",
     "report",
     "scan",
