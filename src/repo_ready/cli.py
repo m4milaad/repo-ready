@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import os
 import sys
@@ -65,6 +66,7 @@ def _parser() -> argparse.ArgumentParser:
     fix.add_argument("--holder", default=None)
     fix.add_argument("--runtime-version", default=None)
     fix.add_argument("--json", action="store_true", dest="as_json")
+    fix.add_argument("--format", choices=("text", "json", "diff"), default=None)
     return parser
 
 
@@ -215,7 +217,7 @@ def _run_fix(args: argparse.Namespace, repository: Path) -> int:
     else:
         after = report(repository)
         score_after = int(after["score"])
-    if args.as_json:
+    if args.as_json or args.format == "json":
         print(
             json.dumps(
                 _fix_result(
@@ -228,6 +230,25 @@ def _run_fix(args: argparse.Namespace, repository: Path) -> int:
                 indent=2,
             )
         )
+    elif args.format == "diff":
+        for operation in outcomes:
+            if operation.action != "create":
+                continue
+            relative = _fix_path(operation, repository)
+            added = operation.content.splitlines(keepends=True)
+            if added and not added[-1].endswith(("\n", "\r")):
+                added[-1] += "\n"
+            print(
+                "".join(
+                    difflib.unified_diff(
+                        [],
+                        added,
+                        fromfile="/dev/null",
+                        tofile=relative,
+                    )
+                ),
+                end="",
+            )
     else:
         _print_fix_report(
             repository,

@@ -207,6 +207,7 @@ weight and are shown as `na`.
 ```sh
 repo-ready fix . --dry-run
 repo-ready fix . --dry-run --json
+repo-ready fix . --dry-run --format diff
 repo-ready fix .
 repo-ready fix . --license mit --holder "Project Authors" --runtime-version 3.12
 ```
@@ -223,6 +224,9 @@ listed in `would_create`:
 ```sh
 python -m repo_ready fix . --dry-run --json > fix-plan.json
 ```
+
+`--format diff` renders the same create-only plan as a reviewable unified
+diff. It is still a dry run and writes no files.
 
 `fix` returns `0` for a valid repository, including a dry run, and `2` for an
 invalid path or usage error.
