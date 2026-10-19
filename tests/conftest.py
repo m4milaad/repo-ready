@@ -9,7 +9,8 @@ import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
-if os.environ.get("REPO_READY_TEST_NO_SRC") != "1" and str(SRC_ROOT) not in sys.path:
+_TEST_NO_SRC_ENV = "REPO_READY_" + "TEST_NO_SRC"
+if os.environ.get(_TEST_NO_SRC_ENV) != "1" and str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 
