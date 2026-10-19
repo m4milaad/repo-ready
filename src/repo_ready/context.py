@@ -69,22 +69,32 @@ def _posix_path(value: str | Path) -> str:
     return str(value).replace("\\", "/").strip("/")
 
 
-def _pattern_matches(path: str, pattern: str) -> bool:
-    """Match both directory prefixes and gitignore-like glob patterns."""
-
+def _normalize_pattern(pattern: str) -> str:
     pattern = _posix_path(pattern)
     while pattern.startswith("./"):
         pattern = pattern[2:]
-    if not pattern:
-        return False
     if pattern.endswith("/**"):
         pattern = pattern[:-3].rstrip("/")
+    return pattern
+
+
+def _pattern_matches(path: str, pattern: str) -> bool:
+    """Match both directory prefixes and gitignore-like glob patterns."""
+
+    return _pattern_matches_normalized(path, _normalize_pattern(pattern))
+
+
+def _pattern_matches_normalized(path: str, pattern: str) -> bool:
+    """Match a path against a pattern that has already been normalized."""
+
+    if not pattern:
+        return False
     if path == pattern or path.startswith(pattern + "/"):
         return True
+    if not any(character in pattern for character in "*?["):
+        return "/" not in pattern and pattern in path.split("/")
     pure = PurePosixPath(path)
     if pure.match(pattern) or fnmatch.fnmatchcase(path, pattern):
-        return True
-    if "/" not in pattern and any(part == pattern for part in pure.parts):
         return True
     return False
 
@@ -125,6 +135,23 @@ class RepoContext:
         self.excludes = tuple(
             dict.fromkeys((*DEFAULT_EXCLUDES, *self.config_excludes, *excludes))
         )
+        self._exclude_patterns = tuple(_normalize_pattern(pattern) for pattern in self.excludes)
+        self._component_excludes = frozenset(
+            pattern
+            for pattern in self._exclude_patterns
+            if pattern and "/" not in pattern and not any(character in pattern for character in "*?[")
+        )
+        self._prefix_excludes = tuple(
+            pattern
+            for pattern in self._exclude_patterns
+            if pattern and "/" in pattern and not any(character in pattern for character in "*?[")
+        )
+        self._glob_excludes = tuple(
+            pattern
+            for pattern in self._exclude_patterns
+            if any(character in pattern for character in "*?[")
+        )
+        self._small_file_cache: dict[str, tuple[int, int, int, bytes]] = {}
         self._entries = self._build_index()
         self._by_path = {entry.path: entry for entry in self._entries}
 
@@ -180,7 +207,12 @@ class RepoContext:
 
     def is_excluded(self, relative: str | Path) -> bool:
         path = _posix_path(relative)
-        return any(_pattern_matches(path, pattern) for pattern in self.excludes)
+        parts = set(path.split("/"))
+        if parts & self._component_excludes:
+            return True
+        if any(path == pattern or path.startswith(pattern + "/") for pattern in self._prefix_excludes):
+            return True
+        return any(_pattern_matches_normalized(path, pattern) for pattern in self._glob_excludes)
 
     def _build_index(self) -> tuple[FileEntry, ...]:
         if not _safe_directory(self.root):
@@ -204,20 +236,29 @@ class RepoContext:
             try:
                 if item.is_symlink():
                     continue
-                if item.is_dir(follow_symlinks=False):
+                information = item.stat(follow_symlinks=False)
+                if stat.S_ISDIR(information.st_mode):
                     self._walk(Path(item.path), relative, found)
                     continue
-                if not item.is_file(follow_symlinks=False):
+                if not stat.S_ISREG(information.st_mode):
                     continue
-                size = item.stat(follow_symlinks=False).st_size
             except OSError:
                 continue
+            size = information.st_size
             too_large = size > self.max_file_bytes
             binary = False
             if not too_large:
                 try:
                     with Path(item.path).open("rb") as source:
-                        binary = b"\x00" in source.read(8192)
+                        sample = source.read(8192)
+                        binary = b"\x00" in sample
+                        if not binary and size <= 8192:
+                            self._small_file_cache[relative] = (
+                                size,
+                                information.st_mtime_ns,
+                                information.st_ctime_ns,
+                                sample,
+                            )
                 except OSError:
                     continue
             found.append(FileEntry(relative, Path(item.path), size, too_large, binary))
@@ -261,6 +302,20 @@ class RepoContext:
         entry = self.entry(path)
         if entry is None or entry.too_large or entry.binary:
             return None
+        cached = self._small_file_cache.get(entry.path)
+        if cached is not None:
+            cached_size, cached_mtime_ns, cached_ctime_ns, cached_data = cached
+            try:
+                information = entry.absolute.stat(follow_symlinks=False)
+                if (
+                    stat.S_ISREG(information.st_mode)
+                    and information.st_size == cached_size
+                    and information.st_mtime_ns == cached_mtime_ns
+                    and information.st_ctime_ns == cached_ctime_ns
+                ):
+                    return cached_data
+            except (OSError, ValueError):
+                return None
         flags = os.O_RDONLY
         nofollow = getattr(os, "O_NOFOLLOW", 0)
         flags |= nofollow
@@ -275,6 +330,13 @@ class RepoContext:
             with os.fdopen(descriptor, "rb") as handle:
                 descriptor = -1
                 data = handle.read(self.max_file_bytes + 1)
+            if len(data) <= 8192 and b"\x00" not in data[:8192]:
+                self._small_file_cache[entry.path] = (
+                    information.st_size,
+                    getattr(information, "st_mtime_ns", 0),
+                    getattr(information, "st_ctime_ns", 0),
+                    data,
+                )
         except (OSError, ValueError):
             return None
         finally:

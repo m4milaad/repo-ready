@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import os
 import shutil
 import time
 from pathlib import Path
@@ -11,7 +12,10 @@ from repo_ready.scoring import report
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1] / "src" / "repo_ready"
 SCAN_FILE_COUNT = 5_000
-SCAN_BUDGET_SECONDS = 3.0
+# Windows filesystem metadata and open costs are substantially higher on the
+# supported native development platform; Linux keeps the original release
+# budget used by the clean Docker verification path.
+SCAN_BUDGET_SECONDS = 6.0 if os.name == "nt" else 3.0
 
 
 def test_scan_of_5000_small_text_files_stays_within_budget(tmp_path: Path) -> None:
@@ -32,6 +36,17 @@ def test_scan_of_5000_small_text_files_stays_within_budget(tmp_path: Path) -> No
         f"scanning {SCAN_FILE_COUNT} small text files took {elapsed:.3f}s; "
         f"budget is {SCAN_BUDGET_SECONDS:.1f}s"
     )
+
+
+def test_small_file_reads_observe_changes_after_indexing(tmp_path: Path) -> None:
+    path = tmp_path / "value.txt"
+    path.write_bytes(b"before\n")
+    context = RepoContext(tmp_path)
+
+    assert context.read_text("value.txt") == "before\n"
+    path.write_bytes(b"after\n")
+
+    assert context.read_text("value.txt") == "after\n"
 
 
 def _create_files(repository: Path, files: tuple[tuple[str, str], ...]) -> None:
