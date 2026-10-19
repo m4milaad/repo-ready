@@ -112,7 +112,9 @@ class RepoContext:
     ``RepoContext`` performs no execution and follows no links. Files larger
     than :data:`MAX_FILE_BYTES` remain in the index as metadata, but guarded
     text/byte reads return ``None`` for them. NUL-containing files are marked
-    binary and are likewise skipped by text reads.
+    binary and are likewise skipped by text reads. Optional file-count and
+    total-byte budgets stop traversal deterministically and expose the reason
+    through :attr:`truncation_reasons`.
     """
 
     def __init__(
@@ -121,6 +123,8 @@ class RepoContext:
         *,
         excludes: Iterable[str] = (),
         max_file_bytes: int = MAX_FILE_BYTES,
+        max_files: int | None = None,
+        max_total_bytes: int | None = None,
     ) -> None:
         candidate = Path(root).expanduser()
         try:
@@ -129,6 +133,12 @@ class RepoContext:
             candidate = Path(os.path.abspath(os.fspath(candidate)))
         self.root = candidate
         self.max_file_bytes = max(0, int(max_file_bytes))
+        self.max_files = None if max_files is None else max(0, int(max_files))
+        self.max_total_bytes = None if max_total_bytes is None else max(0, int(max_total_bytes))
+        self._truncated = False
+        self._truncation_reasons: set[str] = set()
+        self._observed_files = 0
+        self._observed_bytes = 0
         config = self._read_config()
         self.min_score = config.min_score
         self.config_excludes = config.excludes
@@ -222,13 +232,21 @@ class RepoContext:
         found.sort(key=lambda entry: entry.path)
         return tuple(found)
 
+    def _mark_truncated(self, reason: str) -> None:
+        self._truncated = True
+        self._truncation_reasons.add(reason)
+
     def _walk(self, directory: Path, prefix: str, found: list[FileEntry]) -> None:
+        if self._truncated:
+            return
         try:
             with os.scandir(directory) as handle:
                 entries = sorted(handle, key=lambda item: item.name)
         except OSError:
             return
         for item in entries:
+            if self._truncated:
+                return
             relative = f"{prefix}/{item.name}" if prefix else item.name
             relative = _posix_path(relative)
             if self.is_excluded(relative):
@@ -245,6 +263,12 @@ class RepoContext:
             except OSError:
                 continue
             size = information.st_size
+            if self.max_files is not None and self._observed_files >= self.max_files:
+                self._mark_truncated("max_files")
+                return
+            if self.max_total_bytes is not None and self._observed_bytes + size > self.max_total_bytes:
+                self._mark_truncated("max_total_bytes")
+                return
             too_large = size > self.max_file_bytes
             binary = False
             if not too_large:
@@ -262,6 +286,26 @@ class RepoContext:
                 except OSError:
                     continue
             found.append(FileEntry(relative, Path(item.path), size, too_large, binary))
+            self._observed_files += 1
+            self._observed_bytes += size
+
+    @property
+    def truncated(self) -> bool:
+        """Whether an optional index budget stopped traversal early."""
+
+        return self._truncated
+
+    @property
+    def truncation_reasons(self) -> tuple[str, ...]:
+        return tuple(sorted(self._truncation_reasons))
+
+    @property
+    def observed_files(self) -> int:
+        return self._observed_files
+
+    @property
+    def observed_bytes(self) -> int:
+        return self._observed_bytes
 
     @property
     def files(self) -> tuple[FileEntry, ...]:

@@ -15,6 +15,7 @@ from .contracts import diagnose
 from .context import ConfigError, RepoContext
 from .fixer import PlannedFile, apply_fix_plan, plan_fixes, project_fix_score, protect_score
 from .formats import render_markdown, render_sarif
+from .tracked import inspect_tracked
 from .scoring import report
 
 
@@ -52,6 +53,10 @@ def _parser() -> argparse.ArgumentParser:
     artifact.add_argument("path", type=Path)
     artifact.add_argument("--project", type=Path, default=None)
     artifact.add_argument("--json", action="store_true", dest="as_json")
+
+    tracked = commands.add_parser("tracked", help="list paths recorded in the Git index")
+    tracked.add_argument("path", nargs="?", type=Path, default=None)
+    tracked.add_argument("--json", action="store_true", dest="as_json")
 
     fix = commands.add_parser("fix", help="scaffold missing repository files")
     fix.add_argument("path", nargs="?", type=Path, default=None)
@@ -178,6 +183,19 @@ def _run_artifact(args: argparse.Namespace) -> int:
         for finding in result.findings:
             member = f" ({finding.member})" if finding.member else ""
             print(f"{finding.severity.upper()} {finding.code}{member}: {finding.detail}")
+    return 0 if result.safe else 1
+
+
+def _run_tracked(args: argparse.Namespace, repository: Path) -> int:
+    result = inspect_tracked(repository)
+    if args.as_json:
+        print(json.dumps(result.as_dict(), indent=2))
+    else:
+        print(f"Path: {repository}")
+        print(f"Index version: {result.index_version or 'unavailable'}")
+        print(f"Tracked files: {len(result.files)}")
+        for finding in result.findings:
+            print(f"{finding['severity'].upper()} {finding['code']}: {finding['detail']}")
     return 0 if result.safe else 1
 
 
@@ -340,6 +358,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "compare":
             args.path = supplied_path
             return _run_compare(args, repository)
+        if args.command == "tracked":
+            args.path = supplied_path
+            return _run_tracked(args, repository)
         return _run_fix(args, repository)
     except ConfigError as error:
         print(f"repo-ready: configuration error: {error}", file=sys.stderr)

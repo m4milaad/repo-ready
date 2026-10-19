@@ -136,6 +136,19 @@ limits, required Python distribution metadata, project/version parity, and
 missing source modules. Artifact inspection is independent of readiness
 scoring and uses its own versioned schema.
 
+### Tracked-tree scope
+
+When a repository scope must be distinguished from local generated files,
+`tracked` reads the Git index directly and does not invoke Git or a shell:
+
+```sh
+repo-ready tracked . --json
+```
+
+The normal `check` command remains a filesystem scan. `tracked` is an explicit
+scope report and identifies malformed or unavailable Git indexes rather than
+silently treating them as a complete tracked tree.
+
 ### Exit codes
 
 | Code | Meaning |
