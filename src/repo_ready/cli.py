@@ -14,6 +14,7 @@ from .baseline import BaselineError, compare_repository
 from .contracts import diagnose
 from .context import ConfigError, RepoContext
 from .fixer import PlannedFile, apply_fix_plan, plan_fixes, project_fix_score, protect_score
+from .formats import render_markdown, render_sarif
 from .scoring import report
 
 
@@ -34,6 +35,7 @@ def _parser() -> argparse.ArgumentParser:
     check = commands.add_parser("check", help="score a local repository")
     check.add_argument("path", nargs="?", type=Path, default=None)
     check.add_argument("--json", action="store_true", dest="as_json")
+    check.add_argument("--format", choices=("text", "json", "markdown", "sarif"), default=None)
     check.add_argument("--min-score", type=int, default=None)
     check.add_argument("--no-color", action="store_true")
 
@@ -115,8 +117,13 @@ def _print_human_report(result: dict[str, object], *, no_color: bool = False) ->
 
 def _run_check(args: argparse.Namespace, repository: Path) -> int:
     result = report(args.path)
-    if args.as_json:
+    output_format = "json" if args.as_json else (args.format or "text")
+    if output_format == "json":
         print(json.dumps(result, indent=2))
+    elif output_format == "markdown":
+        print(render_markdown(result))
+    elif output_format == "sarif":
+        print(render_sarif(result))
     else:
         _print_human_report(result, no_color=args.no_color)
     context = RepoContext(repository)

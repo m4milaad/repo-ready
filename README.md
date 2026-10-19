@@ -74,6 +74,17 @@ standard output, so it can be saved or passed to another tool:
 python -m repo_ready check ./some-repository --json --min-score 80 > readiness.json
 ```
 
+Review and integration formats are also available:
+
+```sh
+repo-ready check . --format markdown
+repo-ready check . --format sarif > readiness.sarif
+```
+
+SARIF contains one result for each failed or partial readiness check and keeps
+repository-relative finding locations. Markdown is intended for pull-request
+summaries; JSON remains the canonical structured report.
+
 `--min-score` sets the minimum accepted score for that invocation. If the
 target repository has `min_score` in `.repo-ready.toml`, the command-line value
 takes precedence. The report is still emitted as JSON when the score is below
