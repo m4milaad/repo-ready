@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 from . import __version__
+from .contracts import diagnose
 from .context import ConfigError, RepoContext
 from .fixer import PlannedFile, apply_fix_plan, plan_fixes, project_fix_score, protect_score
 from .scoring import report
@@ -33,6 +34,10 @@ def _parser() -> argparse.ArgumentParser:
     check.add_argument("--json", action="store_true", dest="as_json")
     check.add_argument("--min-score", type=int, default=None)
     check.add_argument("--no-color", action="store_true")
+
+    diagnose_command = commands.add_parser("diagnose", help="inspect cross-file repository contracts")
+    diagnose_command.add_argument("path", nargs="?", type=Path, default=None)
+    diagnose_command.add_argument("--json", action="store_true", dest="as_json")
 
     fix = commands.add_parser("fix", help="scaffold missing repository files")
     fix.add_argument("path", nargs="?", type=Path, default=None)
@@ -107,6 +112,21 @@ def _run_check(args: argparse.Namespace, repository: Path) -> int:
     if threshold is not None and int(result["score"]) < threshold:
         return 1
     return 0
+
+
+def _run_diagnose(args: argparse.Namespace, repository: Path) -> int:
+    graph = diagnose(repository)
+    if args.as_json:
+        print(json.dumps(graph.as_dict(), indent=2))
+    else:
+        print(f"Path: {repository}")
+        print(f"Contract graph: v{graph.version}")
+        print(f"Evidence: {len(graph.evidence)}")
+        print(f"Edges: {len(graph.edges)}")
+        print(f"Diagnostics: {len(graph.diagnostics)}")
+        for diagnostic in graph.diagnostics:
+            print(f"{diagnostic.severity.upper()} {diagnostic.code}: {diagnostic.message}")
+    return 1 if any(item.severity == "error" for item in graph.diagnostics) else 0
 
 
 def _run_fix(args: argparse.Namespace, repository: Path) -> int:
@@ -256,6 +276,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "check":
             args.path = supplied_path
             return _run_check(args, repository)
+        if args.command == "diagnose":
+            args.path = supplied_path
+            return _run_diagnose(args, repository)
         return _run_fix(args, repository)
     except ConfigError as error:
         print(f"repo-ready: configuration error: {error}", file=sys.stderr)

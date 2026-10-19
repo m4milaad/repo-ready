@@ -1,0 +1,1085 @@
+"""Static cross-file contract diagnostics.
+
+The readiness score intentionally remains a small, stable checklist.  This
+module adds a separate evidence graph for contradictions between the files
+that make up a repository's setup contract.  It never executes a target
+repository, invokes a package manager, or leaves the filesystem boundary
+provided by :class:`~repo_ready.context.RepoContext`.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import tomllib
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Literal
+
+from .checks import (
+    _docker_image,
+    _dockerfile_instructions,
+    _root_dockerfile,
+    _text,
+)
+from .context import RepoContext
+from .detector import detect_ecosystems
+
+
+EvidenceKind = Literal[
+    "document",
+    "command",
+    "manifest",
+    "dependency",
+    "lockfile",
+    "runtime",
+    "container",
+    "workflow",
+    "artifact",
+]
+ContractStatus = Literal["satisfied", "mismatch", "missing", "unknown"]
+DiagnosticSeverity = Literal["info", "warning", "error"]
+
+
+@dataclass(frozen=True)
+class Evidence:
+    """One bounded, repository-relative fact used by the contract graph."""
+
+    id: str
+    kind: EvidenceKind
+    subject: str
+    file: str
+    line: int | None
+    value: str
+    normalized: str
+    attributes: tuple[tuple[str, str], ...] = ()
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "kind": self.kind,
+            "subject": self.subject,
+            "file": self.file,
+            "line": self.line,
+            "value": self.value,
+            "normalized": self.normalized,
+            "attributes": {key: value for key, value in self.attributes},
+        }
+
+
+@dataclass(frozen=True)
+class ContractEdge:
+    """A deterministic relationship between two evidence records."""
+
+    id: str
+    relation: str
+    source: str
+    target: str | None
+    status: ContractStatus
+    expected: str | None
+    actual: str | None
+    detail: str
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "relation": self.relation,
+            "source": self.source,
+            "target": self.target,
+            "status": self.status,
+            "expected": self.expected,
+            "actual": self.actual,
+            "detail": self.detail,
+        }
+
+
+@dataclass(frozen=True)
+class ContractDiagnostic:
+    """A non-scoring explanation of a cross-file inconsistency."""
+
+    code: str
+    severity: DiagnosticSeverity
+    message: str
+    evidence: tuple[str, ...]
+    related_checks: tuple[str, ...] = ()
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "code": self.code,
+            "severity": self.severity,
+            "message": self.message,
+            "evidence": list(self.evidence),
+            "related_checks": list(self.related_checks),
+        }
+
+
+@dataclass(frozen=True)
+class ContractGraph:
+    """Versioned static evidence graph, separate from the readiness score."""
+
+    version: int
+    evidence: tuple[Evidence, ...]
+    edges: tuple[ContractEdge, ...]
+    diagnostics: tuple[ContractDiagnostic, ...]
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "version": self.version,
+            "evidence": [item.as_dict() for item in self.evidence],
+            "edges": [item.as_dict() for item in self.edges],
+            "diagnostics": [item.as_dict() for item in self.diagnostics],
+        }
+
+
+GRAPH_VERSION = 1
+_COMMAND_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("make-test", re.compile(r"^make\s+(?:-s\s+)?test(?:\s|$)")),
+    ("pytest", re.compile(r"^(?:(?:python(?:3(?:\.\d+)?)?|py)\s+-m\s+)?pytest(?:\s|$)")),
+    ("tox", re.compile(r"^tox(?:\s|$)")),
+    ("nox", re.compile(r"^nox(?:\s|$)")),
+    ("npm-test", re.compile(r"^npm\s+(?:run\s+)?test(?:\s|$)")),
+    ("yarn-test", re.compile(r"^yarn\s+test(?:\s|$)")),
+    ("pnpm-test", re.compile(r"^pnpm\s+(?:run\s+)?test(?:\s|$)")),
+)
+_INSTALL_COMMANDS = re.compile(
+    r"^(?:python(?:3(?:\.\d+)?)?\s+-m\s+pip|pip|npm|yarn|pnpm|uv|poetry)\s+(?:install|ci|sync)\b"
+)
+_RUNTIME_VERSION = re.compile(r"(?<!\d)(\d+)(?:\.(\d+))?(?:\.(\d+))?(?!\d)")
+_PYTHON_FILES = (".python-version", "runtime.txt")
+_NODE_FILES = (".nvmrc", ".node-version")
+
+
+def _normalize_command(value: str) -> str:
+    value = value.strip()
+    value = re.sub(r"^[\@\+\-]+\s*", "", value)
+    value = re.sub(r"\s+", " ", value)
+    return value
+
+
+def _command_family(value: str) -> str | None:
+    normalized = _normalize_command(value)
+    for family, pattern in _COMMAND_PATTERNS:
+        if pattern.search(normalized):
+            return family
+    return None
+
+
+def _runtime_version(value: str, *, node: bool = False) -> str | None:
+    match = _RUNTIME_VERSION.search(value.strip().lstrip("v"))
+    if not match:
+        return None
+    parts = [part for part in match.groups() if part is not None]
+    if not node and len(parts) < 2:
+        return None
+    return ".".join(parts)
+
+
+def _attrs(**values: object) -> tuple[tuple[str, str], ...]:
+    return tuple(sorted((key, str(value)) for key, value in values.items() if value is not None))
+
+
+def _evidence_id(kind: str, subject: str, file: str, line: int | None) -> str:
+    return f"{kind}:{subject}:{file}:{line if line is not None else 0}"
+
+
+def _add_evidence(
+    items: list[Evidence],
+    *,
+    kind: EvidenceKind,
+    subject: str,
+    file: str,
+    line: int | None,
+    value: str,
+    normalized: str | None = None,
+    attributes: tuple[tuple[str, str], ...] = (),
+) -> Evidence:
+    bounded = value.strip()[:512]
+    item = Evidence(
+        id=_evidence_id(kind, subject, file, line),
+        kind=kind,
+        subject=subject,
+        file=file,
+        line=line,
+        value=bounded,
+        normalized=(normalized if normalized is not None else bounded)[:512],
+        attributes=attributes,
+    )
+    if item.id not in {existing.id for existing in items}:
+        items.append(item)
+    return item
+
+
+def _readable_text(context: RepoContext, path: str) -> str | None:
+    return context.read_text(path)
+
+
+def _manifest_json(context: RepoContext) -> dict[str, object] | None:
+    text = _readable_text(context, "package.json")
+    if text is None:
+        return None
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _manifest_toml(context: RepoContext) -> dict[str, object] | None:
+    text = _readable_text(context, "pyproject.toml")
+    if text is None:
+        return None
+    try:
+        value = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _line_number(text: str, offset: int) -> int:
+    return text.count("\n", 0, offset) + 1
+
+
+def _command_from_line(line: str) -> tuple[str, str] | None:
+    candidate = line.strip().strip("`*")
+    candidate = re.sub(r"^(?:[-+]\s+|\d+[.)]\s+)", "", candidate)
+    candidate = _normalize_command(candidate)
+    family = _command_family(candidate)
+    return (family, candidate) if family else None
+
+
+def _collect_readme(context: RepoContext, evidence: list[Evidence]) -> None:
+    selected = _text(context, ("README.md", "README.rst", "README.txt"))
+    if selected is None:
+        return
+    path, text = selected
+    headings: list[tuple[int, str]] = []
+    for number, line in enumerate(text.splitlines(), 1):
+        match = re.match(r"^\s*#{1,6}\s+(.+?)\s*#*\s*$", line)
+        if match:
+            headings.append((number, match.group(1).strip().casefold()))
+    sections = {"test", "testing", "run", "usage", "requirements", "runtime", "setup", "install", "installation", "rebuild", "deploy"}
+    lines = text.splitlines()
+    for index, (start, title) in enumerate(headings):
+        if title not in sections:
+            continue
+        end = headings[index + 1][0] - 1 if index + 1 < len(headings) else len(lines)
+        for number in range(start, end + 1):
+            command = _command_from_line(lines[number - 1])
+            if command is not None:
+                family, value = command
+                _add_evidence(
+                    evidence,
+                    kind="command",
+                    subject=f"readme-{family}",
+                    file=path,
+                    line=number,
+                    value=value,
+                    normalized=family,
+                    attributes=_attrs(source="readme", section=title, family=family),
+                )
+            stripped = lines[number - 1].strip()
+            if title in {"requirements", "runtime"}:
+                runtime = _runtime_version(stripped, node="node" in stripped.casefold())
+                if runtime:
+                    ecosystem = "node" if "node" in stripped.casefold() else "python"
+                    _add_evidence(
+                        evidence,
+                        kind="runtime",
+                        subject=f"readme-{ecosystem}",
+                        file=path,
+                        line=number,
+                        value=stripped,
+                        normalized=runtime,
+                        attributes=_attrs(ecosystem=ecosystem, source="readme"),
+                    )
+
+
+def _make_test_recipe(text: str) -> tuple[int, str] | None:
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        match = re.match(r"^\s*test\s*:\s*(.*)$", line)
+        if not match:
+            continue
+        inline = match.group(1).strip()
+        if inline.startswith(";"):
+            value = _normalize_command(inline[1:])
+            return (index + 1, value) if _command_family(value) else None
+        for recipe_number, recipe in enumerate(lines[index + 1 :], index + 2):
+            if recipe.lstrip().startswith("#"):
+                continue
+            if recipe.startswith(("\t", "    ")) and recipe.strip():
+                value = _normalize_command(recipe)
+                if _command_family(value):
+                    return recipe_number, value
+                continue
+            if recipe and not recipe.startswith((" ", "\t")):
+                break
+    return None
+
+
+def _collect_makefile(context: RepoContext, evidence: list[Evidence]) -> None:
+    selected = _text(context, ("Makefile", "makefile", "GNUmakefile"))
+    if selected is None:
+        return
+    path, text = selected
+    recipe = _make_test_recipe(text)
+    if recipe is not None:
+        line, value = recipe
+        family = _command_family(value) or "unknown"
+        _add_evidence(
+            evidence,
+            kind="command",
+            subject="make-test",
+            file=path,
+            line=line,
+            value=value,
+            normalized=family,
+            attributes=_attrs(source="makefile", family=family),
+        )
+    for number, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if _INSTALL_COMMANDS.search(_normalize_command(stripped)):
+            _add_evidence(
+                evidence,
+                kind="command",
+                subject="make-install",
+                file=path,
+                line=number,
+                value=_normalize_command(stripped),
+                normalized="install",
+                attributes=_attrs(source="makefile", family="install"),
+            )
+
+
+def _collect_manifests(context: RepoContext, ecosystems: tuple[str, ...], evidence: list[Evidence]) -> None:
+    package = _manifest_json(context)
+    if package is not None:
+        scripts = package.get("scripts")
+        if isinstance(scripts, dict) and isinstance(scripts.get("test"), str):
+            value = _normalize_command(str(scripts["test"]))
+            family = _command_family(value)
+            if family:
+                _add_evidence(
+                    evidence,
+                    kind="command",
+                    subject="package-test",
+                    file="package.json",
+                    line=1,
+                    value=value,
+                    normalized=family,
+                    attributes=_attrs(source="package.json", family=family),
+                )
+        engines = package.get("engines")
+        if isinstance(engines, dict) and isinstance(engines.get("node"), str):
+            _add_evidence(
+                evidence,
+                kind="runtime",
+                subject="package-node",
+                file="package.json",
+                line=1,
+                value=str(engines["node"]),
+                normalized=_runtime_version(str(engines["node"]), node=True) or str(engines["node"]),
+                attributes=_attrs(ecosystem="node", source="package.json", constraint=str(engines["node"])),
+            )
+        for group in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
+            values = package.get(group)
+            if isinstance(values, dict):
+                for name, spec in sorted(values.items()):
+                    _add_evidence(
+                        evidence,
+                        kind="dependency",
+                        subject=f"node:{name}",
+                        file="package.json",
+                        line=1,
+                        value=f"{name}: {spec}",
+                        normalized=str(name).casefold(),
+                        attributes=_attrs(ecosystem="node", group=group, name=name, spec=spec),
+                    )
+
+    document = _manifest_toml(context)
+    if document is not None:
+        project = document.get("project")
+        if isinstance(project, dict):
+            requires = project.get("requires-python")
+            if isinstance(requires, str):
+                _add_evidence(
+                    evidence,
+                    kind="runtime",
+                    subject="pyproject-python",
+                    file="pyproject.toml",
+                    line=1,
+                    value=requires,
+                    normalized=_runtime_version(requires) or requires,
+                    attributes=_attrs(ecosystem="python", source="pyproject.toml", constraint=requires),
+                )
+            dependencies = project.get("dependencies")
+            if isinstance(dependencies, list):
+                for dependency in dependencies:
+                    if isinstance(dependency, str):
+                        name = re.split(r"[ <>=!~;\[]", dependency, maxsplit=1)[0]
+                        _add_evidence(
+                            evidence,
+                            kind="dependency",
+                            subject=f"python:{name}",
+                            file="pyproject.toml",
+                            line=1,
+                            value=dependency,
+                            normalized=name.casefold(),
+                            attributes=_attrs(ecosystem="python", name=name, spec=dependency),
+                        )
+
+    for entry in context:
+        if not re.fullmatch(r"requirements(?:-[^/]+)?\.txt", entry.path):
+            continue
+        text = context.read_text(entry)
+        if text is None:
+            continue
+        for number, line in enumerate(text.splitlines(), 1):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or stripped.startswith("-"):
+                continue
+            name = re.split(r"[ <>=!~;\[]", stripped, maxsplit=1)[0]
+            _add_evidence(
+                evidence,
+                kind="dependency",
+                subject=f"python:{name}",
+                file=entry.path,
+                line=number,
+                value=stripped,
+                normalized=name.casefold(),
+                attributes=_attrs(ecosystem="python", name=name, spec=stripped),
+            )
+
+
+def _collect_runtime(context: RepoContext, ecosystems: tuple[str, ...], evidence: list[Evidence]) -> None:
+    for ecosystem, names, node in (
+        ("python", _PYTHON_FILES, False),
+        ("node", _NODE_FILES, True),
+    ):
+        if ecosystem not in ecosystems:
+            continue
+        for path in names:
+            text = context.read_text(path)
+            if text is None:
+                continue
+            value = _runtime_version(text, node=node)
+            if value:
+                _add_evidence(
+                    evidence,
+                    kind="runtime",
+                    subject=f"pin-{ecosystem}",
+                    file=path,
+                    line=1,
+                    value=text.strip(),
+                    normalized=value,
+                    attributes=_attrs(ecosystem=ecosystem, source=path, role="pin"),
+                )
+        tools = context.read_text(".tool-versions")
+        if tools is not None:
+            tool_name = "nodejs" if node else "python"
+            for number, line in enumerate(tools.splitlines(), 1):
+                if re.match(rf"^\s*{tool_name}\s+", line):
+                    value = _runtime_version(line, node=node)
+                    if value:
+                        _add_evidence(
+                            evidence,
+                            kind="runtime",
+                            subject=f"tools-{ecosystem}",
+                            file=".tool-versions",
+                            line=number,
+                            value=line.strip(),
+                            normalized=value,
+                            attributes=_attrs(ecosystem=ecosystem, source=".tool-versions", role="pin"),
+                        )
+
+
+def _collect_workflows(context: RepoContext, evidence: list[Evidence]) -> None:
+    for entry in context:
+        if not entry.path.startswith(".github/workflows/"):
+            continue
+        text = context.read_text(entry)
+        if text is None:
+            continue
+        lines = text.splitlines()
+        in_run_block = False
+        run_indent = 0
+        for number, line in enumerate(lines, 1):
+            stripped = line.strip()
+            indent = len(line) - len(line.lstrip())
+            setup_python = re.search(r"python-version:\s*[\"']?([^\"'\s]+)", line)
+            if setup_python:
+                _add_evidence(
+                    evidence,
+                    kind="runtime",
+                    subject="ci-python",
+                    file=entry.path,
+                    line=number,
+                    value=setup_python.group(1),
+                    normalized=_runtime_version(setup_python.group(1)) or setup_python.group(1),
+                    attributes=_attrs(ecosystem="python", source="workflow", role="ci"),
+                )
+            setup_node = re.search(r"node-version:\s*[\"']?([^\"'\s]+)", line)
+            if setup_node:
+                _add_evidence(
+                    evidence,
+                    kind="runtime",
+                    subject="ci-node",
+                    file=entry.path,
+                    line=number,
+                    value=setup_node.group(1),
+                    normalized=_runtime_version(setup_node.group(1), node=True) or setup_node.group(1),
+                    attributes=_attrs(ecosystem="node", source="workflow", role="ci"),
+                )
+            if re.match(r"^\s*run:\s*\|", line):
+                in_run_block = True
+                run_indent = indent
+                continue
+            if in_run_block and line.strip() and indent <= run_indent:
+                in_run_block = False
+            candidate = stripped
+            if candidate.startswith("run:"):
+                candidate = candidate[4:].strip()
+            if in_run_block or candidate:
+                command = _command_from_line(candidate)
+                if command:
+                    family, value = command
+                    _add_evidence(
+                        evidence,
+                        kind="command",
+                        subject=f"ci-{family}",
+                        file=entry.path,
+                        line=number,
+                        value=value,
+                        normalized=family,
+                        attributes=_attrs(source="workflow", family=family),
+                    )
+                if _INSTALL_COMMANDS.search(_normalize_command(candidate)):
+                    _add_evidence(
+                        evidence,
+                        kind="command",
+                        subject="ci-install",
+                        file=entry.path,
+                        line=number,
+                        value=_normalize_command(candidate),
+                        normalized="install",
+                        attributes=_attrs(source="workflow", family="install"),
+                    )
+
+
+def _collect_docker(context: RepoContext, evidence: list[Evidence]) -> None:
+    path, text = _root_dockerfile(context)
+    if path is None or text is None:
+        return
+    instructions = _dockerfile_instructions(text)
+    final_from = max((index for index, item in enumerate(instructions) if item[0] == "FROM"), default=-1)
+    for index, (instruction, line, body) in enumerate(instructions):
+        if instruction == "FROM":
+            image = _docker_image(body)
+            if image:
+                runtime = _runtime_version(image, node=image.casefold().startswith("node"))
+                ecosystem = "node" if image.casefold().startswith("node") else "python" if image.casefold().startswith("python") else ""
+                _add_evidence(
+                    evidence,
+                    kind="container",
+                    subject="docker-from",
+                    file=path,
+                    line=line,
+                    value=image,
+                    normalized=runtime or image,
+                    attributes=_attrs(ecosystem=ecosystem, image=image, stage="final" if index == final_from else "build"),
+                )
+        if instruction in {"CMD", "ENTRYPOINT"} and index > final_from:
+            command = _command_from_line(body.strip("[]\"'"))
+            if command:
+                family, value = command
+                _add_evidence(
+                    evidence,
+                    kind="command",
+                    subject=f"docker-{family}",
+                    file=path,
+                    line=line,
+                    value=value,
+                    normalized=family,
+                    attributes=_attrs(source="docker", family=family, stage="final"),
+                )
+    for number, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = re.match(r"(?i)^(RUN|COPY|ADD)\s+(.*)$", stripped)
+        if not match:
+            continue
+        instruction, body = match.groups()
+        if instruction == "RUN":
+            command = _command_from_line(body)
+            if command:
+                family, value = command
+                _add_evidence(
+                    evidence,
+                    kind="command",
+                    subject=f"docker-run-{family}",
+                    file=path,
+                    line=number,
+                    value=value,
+                    normalized=family,
+                    attributes=_attrs(source="docker", family=family),
+                )
+            if _INSTALL_COMMANDS.search(_normalize_command(body)):
+                _add_evidence(
+                    evidence,
+                    kind="command",
+                    subject="docker-install",
+                    file=path,
+                    line=number,
+                    value=_normalize_command(body),
+                    normalized="install",
+                    attributes=_attrs(source="docker", family="install"),
+                )
+        else:
+            parts = body.split()
+            if len(parts) >= 2:
+                source = parts[-2]
+                if not source.startswith(("--", "<<")):
+                    _add_evidence(
+                        evidence,
+                        kind="container",
+                        subject="docker-copy",
+                        file=path,
+                        line=number,
+                        value=source,
+                        normalized=source,
+                        attributes=_attrs(source="docker", instruction=instruction),
+                    )
+
+
+def _collect_locks(context: RepoContext, evidence: list[Evidence]) -> None:
+    names = (
+        "uv.lock", "poetry.lock", "Pipfile.lock", "pdm.lock", "package-lock.json",
+        "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml",
+    )
+    for name in names:
+        entry = context.entry(name)
+        if entry is not None and entry.readable:
+            _add_evidence(
+                evidence,
+                kind="lockfile",
+                subject=f"lock:{name}",
+                file=name,
+                line=1,
+                value=name,
+                normalized=name,
+                attributes=_attrs(source="filesystem", role="lockfile"),
+            )
+    for entry in context:
+        if re.fullmatch(r"requirements(?:-[^/]+)?\.lock", entry.path) and entry.readable:
+            _add_evidence(
+                evidence,
+                kind="lockfile",
+                subject=f"lock:{entry.path}",
+                file=entry.path,
+                line=1,
+                value=entry.path,
+                normalized=entry.path,
+                attributes=_attrs(source="filesystem", role="requirements-lock"),
+            )
+
+
+def _by_subject(evidence: Iterable[Evidence], prefix: str, *, kind: EvidenceKind | None = None) -> list[Evidence]:
+    return sorted(
+        (
+            item
+            for item in evidence
+            if item.subject.startswith(prefix) and (kind is None or item.kind == kind)
+        ),
+        key=lambda item: item.id,
+    )
+
+
+def _edge(
+    edges: list[ContractEdge],
+    *,
+    relation: str,
+    source: Evidence,
+    target: Evidence | None,
+    status: ContractStatus,
+    expected: str | None,
+    actual: str | None,
+    detail: str,
+) -> ContractEdge:
+    target_id = target.id if target is not None else None
+    item = ContractEdge(
+        id=f"{relation}:{source.id}:{target_id or expected or 'missing'}",
+        relation=relation,
+        source=source.id,
+        target=target_id,
+        status=status,
+        expected=expected,
+        actual=actual,
+        detail=detail,
+    )
+    if item.id not in {existing.id for existing in edges}:
+        edges.append(item)
+    return item
+
+
+def _diagnostic(
+    diagnostics: list[ContractDiagnostic],
+    *,
+    code: str,
+    severity: DiagnosticSeverity,
+    message: str,
+    evidence: Iterable[Evidence],
+    related_checks: tuple[str, ...] = (),
+) -> None:
+    ids = tuple(sorted(item.id for item in evidence))
+    item = ContractDiagnostic(code, severity, message, ids, related_checks)
+    if item not in diagnostics:
+        diagnostics.append(item)
+
+
+def _link_commands(
+    evidence: list[Evidence],
+    edges: list[ContractEdge],
+    diagnostics: list[ContractDiagnostic],
+) -> None:
+    readme = _by_subject(evidence, "readme-", kind="command")
+    effective = _by_subject(evidence, "make-test", kind="command") or _by_subject(evidence, "package-test", kind="command")
+    if readme and not effective and any(item.normalized == "make-test" for item in readme):
+        source = next(item for item in readme if item.normalized == "make-test")
+        _edge(
+            edges,
+            relation="implements",
+            source=source,
+            target=None,
+            status="missing",
+            expected="Makefile test target",
+            actual=None,
+            detail="README refers to make test but no usable Makefile test recipe was found.",
+        )
+        _diagnostic(
+            diagnostics,
+            code="CG002",
+            severity="warning",
+            message="README refers to make test, but no usable Makefile test target exists.",
+            evidence=(source,),
+            related_checks=("RR09",),
+        )
+    if readme and effective:
+        selected = effective[0]
+        for source in readme:
+            status: ContractStatus = "satisfied" if _commands_match(source, selected) else "mismatch"
+            edge = _edge(
+                edges,
+                relation="documents",
+                source=source,
+                target=selected,
+                status=status,
+                expected=selected.normalized,
+                actual=source.normalized,
+                detail="README test command compared with the selected repository test command.",
+            )
+            if edge.status == "mismatch":
+                _diagnostic(
+                    diagnostics,
+                    code="CG001",
+                    severity="warning",
+                    message=(
+                        f"README test command family {source.normalized!r} differs from "
+                        f"the selected project test command family {selected.normalized!r}."
+                    ),
+                    evidence=(source, selected),
+                    related_checks=("RR01", "RR09"),
+                )
+    make = _by_subject(evidence, "make-test", kind="command")
+    package = _by_subject(evidence, "package-test", kind="command")
+    if make and package:
+        edge = _edge(
+            edges,
+            relation="implements",
+            source=make[0],
+            target=package[0],
+            status="satisfied" if _commands_match(make[0], package[0]) else "mismatch",
+            expected=package[0].normalized,
+            actual=make[0].normalized,
+            detail="Makefile test recipe compared with package.json scripts.test.",
+        )
+        if edge.status == "mismatch":
+            _diagnostic(
+                diagnostics,
+                code="CG004",
+                severity="warning",
+                message="Makefile test recipe conflicts with package.json scripts.test.",
+                evidence=(make[0], package[0]),
+                related_checks=("RR09",),
+            )
+    ci = _by_subject(evidence, "ci-", kind="command")
+    ci_tests = [item for item in ci if item.subject != "ci-install"]
+    for source in ci_tests:
+        if not effective:
+            continue
+        target = effective[0]
+        status: ContractStatus = "satisfied" if _commands_match(source, target) else "mismatch"
+        edge = _edge(
+            edges,
+            relation="invokes",
+            source=source,
+            target=target,
+            status=status,
+            expected=target.normalized,
+            actual=source.normalized,
+            detail="CI test command compared with the selected project test command.",
+        )
+        if edge.status == "mismatch":
+            _diagnostic(
+                diagnostics,
+                code="CG005",
+                severity="warning",
+                message="CI test command conflicts with the selected project test command.",
+                evidence=(source, target),
+                related_checks=("RR09", "RR13"),
+            )
+    docker = [
+        item
+        for item in evidence
+        if item.kind == "command"
+        and item.subject.startswith("docker-")
+        and item.subject != "docker-install"
+    ]
+    for source in docker:
+        if not effective:
+            continue
+        target = effective[0]
+        status = "satisfied" if _commands_match(source, target) else "mismatch"
+        edge = _edge(
+            edges,
+            relation="implements",
+            source=source,
+            target=target,
+            status=status,
+            expected=target.normalized,
+            actual=source.normalized,
+            detail="Docker test command compared with the selected project test command.",
+        )
+        if edge.status == "mismatch":
+            _diagnostic(
+                diagnostics,
+                code="CG006",
+                severity="warning",
+                message="Docker test command conflicts with the selected project test command.",
+                evidence=(source, target),
+                related_checks=("RR08", "RR09"),
+            )
+
+
+def _compatible_runtime(pin: Evidence, candidate: Evidence) -> bool | None:
+    if pin.normalized == candidate.normalized:
+        return True
+    constraint = dict(candidate.attributes).get("constraint", "")
+    version = pin.normalized
+    if constraint.startswith(">="):
+        try:
+            return tuple(int(part) for part in version.split(".")) >= tuple(int(part) for part in constraint[2:].split("."))
+        except ValueError:
+            return None
+    if constraint.startswith("^"):
+        try:
+            lower = tuple(int(part) for part in constraint[1:].split("."))
+            current = tuple(int(part) for part in version.split("."))
+            return current >= lower and current[0] == lower[0]
+        except ValueError:
+            return None
+    if constraint and any(character in constraint for character in "<>=~|* "):
+        return None
+    return False
+
+
+def _commands_match(source: Evidence, target: Evidence) -> bool:
+    if source.normalized == target.normalized:
+        return True
+    return source.normalized == "make-test" and target.subject == "make-test"
+
+def _link_runtimes(
+    evidence: list[Evidence],
+    edges: list[ContractEdge],
+    diagnostics: list[ContractDiagnostic],
+) -> None:
+    for ecosystem in ("python", "node"):
+        pins = [item for item in evidence if item.kind == "runtime" and item.subject.startswith("pin-") and dict(item.attributes).get("ecosystem") == ecosystem]
+        if not pins:
+            continue
+        pin = pins[0]
+        candidates = [
+            item
+            for item in evidence
+            if item.kind in {"runtime", "container"}
+            and dict(item.attributes).get("ecosystem") == ecosystem
+            and item.id != pin.id
+        ]
+        for candidate in candidates:
+            compatible = _compatible_runtime(pin, candidate)
+            status: ContractStatus = "unknown" if compatible is None else "satisfied" if compatible else "mismatch"
+            edge = _edge(
+                edges,
+                relation="matches",
+                source=pin,
+                target=candidate,
+                status=status,
+                expected=pin.normalized,
+                actual=candidate.normalized,
+                detail=f"{ecosystem} runtime declarations compared.",
+            )
+            if edge.status == "mismatch":
+                code = "CG011" if candidate.subject.startswith("ci-") else "CG012" if candidate.subject.startswith("docker-") else "CG013"
+                _diagnostic(
+                    diagnostics,
+                    code=code,
+                    severity="error",
+                    message=f"{ecosystem} runtime declaration {candidate.value!r} conflicts with pinned runtime {pin.value!r}.",
+                    evidence=(pin, candidate),
+                    related_checks=("RR07", "RR08", "RR13"),
+                )
+
+
+def _link_dependencies(
+    context: RepoContext,
+    evidence: list[Evidence],
+    edges: list[ContractEdge],
+    diagnostics: list[ContractDiagnostic],
+) -> None:
+    locks = [item for item in evidence if item.kind == "lockfile"]
+    for dependency in (item for item in evidence if item.kind == "dependency"):
+        attrs = dict(dependency.attributes)
+        ecosystem = attrs.get("ecosystem")
+        if ecosystem == "node":
+            candidates = [item for item in locks if item.file in {"package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml"}]
+        elif ecosystem == "python":
+            candidates = [item for item in locks if item.file in {"uv.lock", "poetry.lock", "Pipfile.lock", "pdm.lock"}]
+        else:
+            candidates = []
+        if not candidates:
+            continue
+        lock = candidates[0]
+        text = context.read_text(lock.file) or ""
+        covered = dependency.normalized in text.casefold()
+        edge = _edge(
+            edges,
+            relation="covers",
+            source=dependency,
+            target=lock,
+            status="satisfied" if covered else "mismatch",
+            expected=dependency.normalized,
+            actual=lock.file,
+            detail="Manifest dependency compared with the selected lockfile text.",
+        )
+        if edge.status == "mismatch":
+            _diagnostic(
+                diagnostics,
+                code="CG009",
+                severity="error",
+                message=f"Declared dependency {attrs.get('name', dependency.normalized)!r} was not found in {lock.file}.",
+                evidence=(dependency, lock),
+                related_checks=("RR06",),
+            )
+
+    install_commands = [item for item in evidence if item.subject in {"ci-install", "docker-install", "make-install"}]
+    for command in install_commands:
+        for referenced in re.findall(r"(?:-r|--requirement|--lockfile)\s+([^\s]+)|\b(package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|uv\.lock|poetry\.lock|Pipfile\.lock|pdm\.lock)\b", command.value):
+            path = next((value for value in referenced if value), "")
+            if not path:
+                continue
+            target = next((item for item in locks if item.file == path), None)
+            status: ContractStatus = "satisfied" if target else "missing"
+            _edge(
+                edges,
+                relation="references",
+                source=command,
+                target=target,
+                status=status,
+                expected=path,
+                actual=target.file if target else None,
+                detail="Install command reference compared with repository lockfiles.",
+            )
+            if target is None:
+                _diagnostic(
+                    diagnostics,
+                    code="CG008" if command.subject.startswith("docker") else "CG007",
+                    severity="error",
+                    message=f"{command.value!r} references missing lock or dependency file {path!r}.",
+                    evidence=(command,),
+                    related_checks=("RR06", "RR08", "RR13"),
+                )
+
+
+def _link_copies(context: RepoContext, evidence: list[Evidence], edges: list[ContractEdge], diagnostics: list[ContractDiagnostic]) -> None:
+    for item in (entry for entry in evidence if entry.subject == "docker-copy"):
+        source = item.value.strip().lstrip("./")
+        if source in {"", "."}:
+            continue
+        target = context.entry(source)
+        _edge(
+            edges,
+            relation="references",
+            source=item,
+            target=None,
+            status="satisfied" if target else "missing",
+            expected=source,
+            actual=source if target else None,
+            detail="Docker COPY/ADD source compared with the repository file index.",
+        )
+        if target is None:
+            _diagnostic(
+                diagnostics,
+                code="CG014",
+                severity="error",
+                message=f"Docker {item.value!r} references a file that is not present in the repository.",
+                evidence=(item,),
+                related_checks=("RR08",),
+            )
+
+
+def build_contract_graph(
+    context: RepoContext,
+    ecosystems: Iterable[str] | None = None,
+) -> ContractGraph:
+    """Build deterministic, non-scoring cross-file diagnostics."""
+
+    values = tuple(sorted(ecosystems if ecosystems is not None else detect_ecosystems(context)))
+    evidence: list[Evidence] = []
+    _collect_readme(context, evidence)
+    _collect_makefile(context, evidence)
+    _collect_manifests(context, values, evidence)
+    _collect_runtime(context, values, evidence)
+    _collect_workflows(context, evidence)
+    _collect_docker(context, evidence)
+    _collect_locks(context, evidence)
+
+    edges: list[ContractEdge] = []
+    diagnostics: list[ContractDiagnostic] = []
+    _link_commands(evidence, edges, diagnostics)
+    _link_runtimes(evidence, edges, diagnostics)
+    _link_dependencies(context, evidence, edges, diagnostics)
+    _link_copies(context, evidence, edges, diagnostics)
+
+    return ContractGraph(
+        version=GRAPH_VERSION,
+        evidence=tuple(sorted(evidence, key=lambda item: item.id)),
+        edges=tuple(sorted(edges, key=lambda item: item.id)),
+        diagnostics=tuple(sorted(diagnostics, key=lambda item: (item.code, item.message, item.evidence))),
+    )
+
+
+def diagnose(root: str | Path, *, context: RepoContext | None = None) -> ContractGraph:
+    """Build a contract graph from a repository path or an existing context."""
+
+    return build_contract_graph(context or RepoContext(root))
+
+
+__all__ = [
+    "ContractDiagnostic",
+    "ContractEdge",
+    "ContractGraph",
+    "Evidence",
+    "GRAPH_VERSION",
+    "build_contract_graph",
+    "diagnose",
+]

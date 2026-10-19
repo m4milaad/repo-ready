@@ -64,6 +64,7 @@ suite normally adds `src/` for convenient local checkout testing; set
 repo-ready check .
 repo-ready check ./some-repository --json
 repo-ready check . --min-score 80 --no-color
+repo-ready diagnose . --json
 ```
 
 JSON output has stable keys and sorted checks/findings for CI. It is written to
@@ -77,6 +78,24 @@ python -m repo_ready check ./some-repository --json --min-score 80 > readiness.j
 target repository has `min_score` in `.repo-ready.toml`, the command-line value
 takes precedence. The report is still emitted as JSON when the score is below
 the threshold; the exit status communicates the result to CI.
+
+### Cross-file contract diagnostics
+
+`diagnose` builds a separate, static evidence graph from README commands,
+Makefile recipes, manifests, lockfiles, runtime pins, CI workflows, and the
+root Dockerfile. It reports contradictions such as a CI runtime that differs
+from `.python-version` or a README test command that differs from the
+effective Makefile command. It does not execute the repository, change the
+100-point readiness score, or add graph data to `check --json`.
+
+```sh
+repo-ready diagnose .
+repo-ready diagnose ./some-repository --json > contract-graph.json
+```
+
+The graph has its own versioned schema with `evidence`, `edges`, and
+`diagnostics` collections. A diagnostic is static evidence, not proof that a
+command succeeds when executed.
 
 ### Exit codes
 
