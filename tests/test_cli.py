@@ -39,6 +39,19 @@ def copy_fixture(tmp_path: Path, case: str) -> Path:
     return destination
 
 
+def create_symlink(link: Path, target: Path, *, target_is_directory: bool = False) -> None:
+    """Create a symlink or skip when the host does not permit test setup."""
+
+    try:
+        link.symlink_to(target, target_is_directory=target_is_directory)
+    except NotImplementedError:
+        pytest.skip("the host does not support symbolic links")
+    except OSError as error:
+        if getattr(error, "winerror", None) == 1314:
+            pytest.skip("Windows symbolic-link privilege is not enabled")
+        raise
+
+
 def checks(value: dict[str, object]) -> dict[str, dict[str, object]]:
     return {str(item["id"]): item for item in value["checks"] if isinstance(item, dict)}
 
@@ -214,7 +227,7 @@ def test_symlinks_are_not_indexed(tmp_path: Path) -> None:
     repository = copy_fixture(tmp_path, "edge-symlinks")
     outside = tmp_path / "outside-secret.txt"
     outside.write_text("password=do-not-scan-this\n", encoding="utf-8")
-    (repository / "linked-secret.txt").symlink_to(outside)
+    create_symlink(repository / "linked-secret.txt", outside)
     assert RepoContext(repository).entry("linked-secret.txt") is None
 
 
@@ -688,7 +701,7 @@ def test_fix_rejects_symlinked_parent(tmp_path: Path) -> None:
     repository = copy_fixture(tmp_path, "empty-repo")
     outside = tmp_path / "outside"
     outside.mkdir()
-    (repository / ".github").symlink_to(outside, target_is_directory=True)
+    create_symlink(repository / ".github", outside, target_is_directory=True)
 
     plans = plan_fixes(repository)
     unsafe = [operation for operation in plans if operation.action == "skip-unsafe"]

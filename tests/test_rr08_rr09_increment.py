@@ -67,9 +67,13 @@ def _assert_command(repository: Path, expected: str) -> None:
 @pytest.mark.parametrize(
     ("contents", "name"),
     (
-        ("\n", "empty"),
-        (b"FROM python:3.12\n\x00CMD [\"python\"]\n", "binary"),
-        (b"FROM python:3.12\n" + b"x" * (1024 * 1024), "oversized"),
+        pytest.param("\n", "empty", id="empty"),
+        pytest.param(b"FROM python:3.12\n\x00CMD [\"python\"]\n", "binary", id="binary"),
+        pytest.param(
+            b"FROM python:3.12\n" + b"x" * (1024 * 1024),
+            "oversized",
+            id="oversized",
+        ),
     ),
 )
 def test_rr08_rejects_empty_binary_and_oversized_dockerfiles(
