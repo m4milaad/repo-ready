@@ -13,16 +13,25 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install -r requirements.lock
-      - name: Build the installed artifact
+      - name: Run the project test suite
+        run: python -m pytest -q
+      - name: Build the wheel
         run: python -m pip wheel --no-deps --no-build-isolation --wheel-dir /tmp/repo-ready-wheel .
-      - name: Install and test the wheel
+      - name: Install and verify the wheel
         env:
           PYTHONPATH: ''
-          REPO_READY_TEST_NO_SRC: '1'
         run: |
           python -m pip install --no-index --force-reinstall --no-deps /tmp/repo-ready-wheel/*.whl
           python -m pip check
           python -c "from pathlib import Path; import repo_ready; package = Path(repo_ready.__file__).resolve(); assert Path.cwd() / 'src' not in package.parents, package"
           python -m repo_ready --version
           repo-ready --version
-          python -m pytest -q
+      - name: Test the installed wheel
+        env:
+          PYTHONPATH: ''
+          REPO_READY_TEST_NO_SRC: '1'
+        run: python -m pytest -q
+      - name: Run the showcase smoke gate
+        env:
+          PYTHONPATH: ''
+        run: python scripts/showcase_smoke.py
