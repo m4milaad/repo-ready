@@ -53,6 +53,41 @@ def _list(items: list[object], empty: str) -> str:
     return '<ul class="plain-list">' + "".join(f"<li>{_escape(item)}</li>" for item in items) + "</ul>"
 
 
+_REPAIR_CATEGORY_LABELS = {
+    "license": "License decision",
+    "runtime": "Runtime choice",
+    "container": "Container setup",
+    "lockfile": "Lockfiles",
+    "test": "Tests and verification",
+    "machine-specific": "Machine-specific paths",
+    "score-protection": "Score protection",
+    "other": "Other review",
+}
+_REPAIR_CATEGORY_ORDER = tuple(_REPAIR_CATEGORY_LABELS)
+
+
+def _repair_category(item: dict) -> str:
+    supplied = str(item.get("category", "")).strip().casefold()
+    if supplied in _REPAIR_CATEGORY_LABELS:
+        return supplied
+    haystack = " ".join(str(item.get(key, "")) for key in ("file", "message", "reason")).casefold()
+    if "license" in haystack or "copyright" in haystack:
+        return "license"
+    if any(value in haystack for value in ("runtime", "python", "node", "version", "pin")):
+        return "runtime"
+    if "docker" in haystack or "container" in haystack:
+        return "container"
+    if "lockfile" in haystack or "lock file" in haystack:
+        return "lockfile"
+    if "test" in haystack or "verification" in haystack:
+        return "test"
+    if "machine" in haystack or "absolute path" in haystack:
+        return "machine-specific"
+    if "score" in haystack or "regress" in haystack:
+        return "score-protection"
+    return "other"
+
+
 def _static_baseline(payload: dict) -> str:
     """Useful baseline content even when the controller is disabled or blocked."""
     analysis = payload["analysis"]
@@ -111,7 +146,8 @@ def _static_baseline(payload: dict) -> str:
         parts.append("</tbody></table></div>")
     else:
         parts.append('<p class="empty">No file evidence was included; there is no schematic to trace.</p>')
-    parts.append('<h3>Relationships</h3>')
+    parts.append('<h3>Evidence map / accessible relationship list</h3>')
+    parts.append('<p class="caption">JavaScript adds the visual map. This deterministic relationship list is the static, accessible equivalent and remains available when the controller is disabled.</p>')
     parts.append(_list([
         f'{edge.get("source", "")} → {edge.get("target") or "unresolved target"} · '
         f'{edge.get("relation", "")} · {edge.get("status", "")} — {edge.get("detail", "")} '
@@ -120,21 +156,50 @@ def _static_baseline(payload: dict) -> str:
     ], "No relationships were included."))
     parts.append('</section><section class="report-section"><h2>Repair notes</h2>')
     if repair:
+        projected_delta = repair.get("score_delta")
+        if projected_delta is None:
+            try:
+                projected_delta = repair["score_after"] - repair["score_before"]
+            except (KeyError, TypeError):
+                projected_delta = "not supplied"
         parts.append(f'<p>Before: {_escape(repair.get("score_before", "—"))} · '
-                     f'Projected: {_escape(repair.get("score_after", "—"))}</p>')
+                     f'Projected: {_escape(repair.get("score_after", "—"))} · '
+                     f'Projected delta: {_escape(projected_delta)}</p>')
+        operations = repair.get("operations", [])
+        creates = [item for item in operations if item.get("action") == "create"]
+        existing = repair.get("existing") or [item for item in operations if item.get("action") == "skip-existing"]
+        parts.append('<h3>Safe create operations</h3>')
         parts.append(_list([
             f'{item.get("action", "")} {item.get("path", "")} — {item.get("reason", "")}'
-            for item in repair.get("operations", [])
-        ], "No automatic repair operations were proposed."))
+            for item in creates
+        ], "No safe create operations were proposed."))
+        parts.append('<h3>Already present / unchanged</h3>')
+        parts.append(_list([
+            f'{item.get("path", "")} — {item.get("reason", "")}'
+            for item in existing
+        ], "No existing files were carried forward in this view."))
         if repair.get("patch"):
             parts.append(f'<pre class="patch" tabindex="0">{_escape(repair["patch"])}</pre>')
         else:
             parts.append('<p class="empty">No downloadable patch was proposed for this view.</p>')
-        parts.append(_list([
-            f'{item.get("file", "")} — {item.get("message", "")} '
-            f'| Related files: {", ".join(item.get("related_files", [])) or "none"}'
-            for item in repair.get("manual", [])
-        ], "No manual repair notes were included."))
+        parts.append('<h3>Remaining manual blockers</h3>')
+        manual = repair.get("manual", [])
+        if not manual:
+            parts.append('<p class="empty">No remaining manual blockers were included.</p>')
+        else:
+            grouped: dict[str, list[dict]] = {}
+            for item in manual:
+                grouped.setdefault(_repair_category(item), []).append(item)
+            for category in _REPAIR_CATEGORY_ORDER:
+                items = grouped.get(category)
+                if not items:
+                    continue
+                parts.append(f'<h4>{_escape(_REPAIR_CATEGORY_LABELS[category])}</h4>')
+                parts.append(_list([
+                    f'{item.get("file", "")} — {item.get("message", "")} '
+                    f'| Related files: {", ".join(item.get("related_files", [])) or "none"}'
+                    for item in items
+                ], "No manual blockers in this category."))
         parts.append(_list(repair.get("limitations", []), "No additional repair limitations were supplied."))
     else:
         parts.append('<p class="empty">No repair plan was included in this report.</p>')

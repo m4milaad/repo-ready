@@ -10,11 +10,11 @@ configuration files without overwriting anything.
 
 This project is a local CLI, so it has no hosted web demo. The reproducible
 offline showcase below is the judge-facing demo. It uses the checked-in
-`python-bad` fixture, so it also demonstrates a repository with evidence worth
-following:
+deterministic demo repository, where all four Breakage Lab scenarios are
+available:
 
 ```sh
-repo-ready showcase tests/fixtures/python-bad/repo --output repo-report.html
+repo-ready showcase examples/showcase-demo --output repo-report.html
 ```
 
 Open `repo-report.html` directly in a browser, select a Breakage Lab scenario,
@@ -287,6 +287,28 @@ python -m pytest -q
 ```
 
 Tests use local fixture repositories and do not access the network.
+
+The deterministic showcase gate can also be run directly:
+
+```sh
+python scripts/showcase_smoke.py
+```
+
+It checks all four Breakage Lab scenarios, packaged report assets, CLI report
+generation, deterministic output, and that the demo repository remains
+unchanged.
+
+With optional Playwright browser tooling installed, run the visual gate against
+the generated report as well:
+
+```sh
+python scripts/browser_smoke.py repo-report.html
+```
+
+The browser gate checks the interactive map, simulated scenario switching,
+receipt download, keyboard-visible selection state, and narrow-screen layout.
+It is separate from the standard test command because browsers are not a
+runtime dependency.
 
 ## Rebuild and offline verification
 

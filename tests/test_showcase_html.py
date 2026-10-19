@@ -112,6 +112,10 @@ def test_real_minimal_report_renders_without_writing_or_mutating(payload: dict, 
     assert "README" in visible_text  # Real legacy checks are present without JS.
     assert "# Setup" in visible_text
     assert "Projected: 14" in visible_text
+    assert "Projected delta: 14" in visible_text
+    assert "Safe create operations" in visible_text
+    assert "Remaining manual blockers" in visible_text
+    assert "License decision" in visible_text
     assert "field-notes" in visible_text
     assert "@@CSP@@" not in result
 
@@ -215,6 +219,27 @@ def test_document_has_no_remote_dependencies_or_unsafe_dom_sinks(payload: dict) 
     downloads = {attrs.get("id"): attrs for tag, attrs in document.elements if tag == "a" and "download" in attrs}
     assert set(downloads) == {"download-patch", "download-receipt"}
     assert all("href" not in attrs for attrs in downloads.values())  # Prepared as Blob links in the browser.
+
+
+def test_report_contains_accessible_visual_map_and_static_equivalent(payload: dict) -> None:
+    graph = payload["analysis"]["baseline"]["graph"]
+    graph["evidence"] = [{
+        "id": "document:readme-test:README.md:5", "kind": "command", "subject": "readme-pytest",
+        "file": "README.md", "line": 5, "value": "pytest", "normalized": "pytest", "attributes": {},
+    }]
+    graph["edges"] = [{
+        "id": "documents:source:target", "relation": "documents",
+        "source": "document:readme-test:README.md:5", "target": None, "status": "missing",
+        "expected": "Makefile test target", "actual": None, "detail": "A supplied relationship.",
+    }]
+    document = Document(render_showcase(seal(payload)))
+    visible_text = " ".join(document.text)
+    assert 'id="evidence-map"' in render_showcase(payload)
+    assert "Evidence map / accessible relationship list" in visible_text
+    assert "A supplied relationship." in visible_text
+    assert "aria-labelledby=\"evidence-map-title\"" in render_showcase(payload)
+    assert "createElementNS" in document.scripts["report-controller"]
+    assert "innerHTML" not in document.scripts["report-controller"]
 
 
 @pytest.mark.parametrize("missing", ["report.html", "report.css", "report.js"])

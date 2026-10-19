@@ -116,6 +116,23 @@ def test_repair_preview_uses_create_only_overlay_and_is_reviewable(tmp_path: Pat
     assert {path.relative_to(repository).as_posix(): path.read_bytes() for path in repository.rglob("*") if path.is_file()} == before
 
 
+def test_repair_preview_separates_existing_files_from_manual_blockers(tmp_path: Path) -> None:
+    repository = _repository(
+        tmp_path,
+        {
+            "README.md": "# Existing\n",
+            "pyproject.toml": "[project]\nname='example'\nversion='1.0'\n",
+        },
+    )
+
+    repair = build_showcase(repository, scenarios=False)["analysis"]["baseline"]["repair"]
+
+    assert any(item["path"] == "README.md" for item in repair["existing"])
+    assert all(item["action"] in {"manual", "skip-unsafe"} for item in repair["manual"])
+    assert all(item["action"] != "skip-existing" for item in repair["manual"])
+    assert {item["category"] for item in repair["manual"]} >= {"license", "runtime", "lockfile", "test"}
+
+
 def test_unavailable_scenarios_explain_missing_contracts(tmp_path: Path) -> None:
     repository = _repository(tmp_path, {"README.md": "# No project\n"})
 

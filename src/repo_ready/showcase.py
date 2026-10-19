@@ -88,6 +88,27 @@ def _patch(operations: list[PlannedFile], root: Path) -> str:
     return "".join(chunks)
 
 
+def _manual_category(operation: PlannedFile) -> str:
+    """Return a stable presentation category for a manual repair blocker."""
+
+    haystack = f"{operation.path.as_posix()} {operation.reason}".casefold()
+    if "license" in haystack or "copyright" in haystack:
+        return "license"
+    if any(value in haystack for value in ("runtime", "python", "node", "version", "pin")):
+        return "runtime"
+    if "docker" in haystack or "container" in haystack:
+        return "container"
+    if "lockfile" in haystack or "lock file" in haystack:
+        return "lockfile"
+    if "test" in haystack or "verification" in haystack:
+        return "test"
+    if "machine" in haystack or "absolute path" in haystack:
+        return "machine-specific"
+    if "score" in haystack or "regress" in haystack:
+        return "score-protection"
+    return "other"
+
+
 def _repair_preview(context: RepoContext, baseline_score: int) -> dict[str, object]:
     """Preview the existing fixer plan against *context* in memory."""
 
@@ -99,10 +120,13 @@ def _repair_preview(context: RepoContext, baseline_score: int) -> dict[str, obje
             "file": _relative_path(operation, root),
             "message": operation.reason,
             "related_files": [],
+            "category": _manual_category(operation),
+            "action": operation.action,
         }
         for operation in plans
-        if operation.action != "create"
+        if operation.action in {"manual", "skip-unsafe"}
     ]
+    existing = [item for item in operations if item["action"] == "skip-existing"]
     changes: dict[str, str] = {}
     for operation in plans:
         if operation.action != "create":
@@ -126,6 +150,7 @@ def _repair_preview(context: RepoContext, baseline_score: int) -> dict[str, obje
         "score_after": score_after,
         "score_delta": score_after - int(baseline_score),
         "operations": operations,
+        "existing": existing,
         "patch": _patch(plans, root),
         "manual": manual,
         "limitations": sorted(set(limitations)),

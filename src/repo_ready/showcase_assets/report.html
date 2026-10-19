@@ -83,7 +83,10 @@
           <h3>File schematic</h3>
           <p class="caption">Deterministic file lanes, grouped by purpose. Lines of evidence are listed as relationships below.</p>
           <div id="file-schematic" class="file-schematic"></div>
-          <h3>Relationships</h3>
+          <h3 id="evidence-map-title">Evidence map</h3>
+          <p id="evidence-map-caption" class="caption">A deterministic map of the supplied evidence records and edges. The relationship list below is the accessible, text equivalent; selecting a diagnostic, file, or record highlights the same chain here.</p>
+          <div id="evidence-map" class="evidence-map" role="group" aria-labelledby="evidence-map-title" aria-describedby="evidence-map-caption"></div>
+          <h3 id="relationship-title">Relationships / accessible map list</h3>
           <ul id="relationship-list" class="relationship-list"></ul>
         </section>
 
@@ -125,10 +128,11 @@
           </div>
           <p>Proposed text for review. Projected scores describe the supplied repair plan.</p>
           <p id="repair-projection" class="projection"></p>
-          <ul id="repair-operations" class="plain-list"></ul>
+          <h3>Safe create operations</h3><ul id="repair-operations" class="plain-list"></ul>
+          <h3>Already present / unchanged</h3><ul id="repair-existing" class="plain-list"></ul>
           <p id="patch-empty" class="empty"></p>
           <pre id="repair-patch" class="patch" tabindex="0" aria-label="Proposed repair patch" hidden></pre>
-          <h3>Manual review</h3><ul id="manual-notes" class="plain-list"></ul>
+          <h3>Remaining manual blockers</h3><div id="manual-notes" class="manual-groups"></div>
           <h3>Repair limits</h3><ul id="repair-limits" class="plain-list"></ul>
         </section>
 

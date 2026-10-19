@@ -40,6 +40,17 @@
   --lane-width: 15rem;
   --control-width: 12rem;
   --patch-height: 36rem;
+  --map-min-width: 64rem;
+  --map-node-width: 13.75rem;
+  --map-node-height: 3.25rem;
+  --map-edge: #8b9088;
+  --map-edge-mismatch: #a1493f;
+  --map-edge-unknown: #777d76;
+  --map-surface: #fbf8f0;
+  --map-edge-width: 1.5px;
+  --map-edge-selected-width: 4px;
+  --map-label-size: 0.75rem;
+  --map-meta-size: 0.625rem;
   --line-height: 1.6;
   --heading-height: 1.15;
   --dur-fast: 120ms;
@@ -134,6 +145,27 @@ summary > .mono { color: var(--ink-muted); font-size: var(--step-small); }
 .file-button small { margin-top: var(--space-2); }
 .is-related { background: var(--accent-paper); }
 .file-button.is-related, .relationship.is-related { border-left: var(--focus-width) solid var(--accent); }
+.evidence-map { overflow-x: auto; margin-top: var(--space-4); border: var(--rule) solid var(--line); border-radius: var(--radius); background: var(--map-surface); }
+.evidence-map svg { display: block; width: 100%; min-width: var(--map-min-width); height: auto; }
+.evidence-map .map-edge { fill: none; stroke: var(--map-edge); stroke-width: var(--map-edge-width); }
+.evidence-map .map-edge-mismatch, .evidence-map .map-edge-missing { stroke: var(--map-edge-mismatch); stroke-dasharray: 6 4; }
+.evidence-map .map-edge-unknown { stroke: var(--map-edge-unknown); stroke-dasharray: 2 4; }
+.evidence-map .map-edge.is-related { stroke: var(--accent); stroke-width: var(--map-edge-selected-width); stroke-dasharray: none; }
+.evidence-map .map-lane-label { fill: var(--ink-muted); font-family: var(--font-evidence); font-size: var(--map-label-size); font-weight: 600; }
+.evidence-map .map-lane-rule { stroke: var(--line); stroke-width: 1; }
+.evidence-map .map-node { cursor: pointer; }
+.evidence-map .map-node rect { fill: var(--surface); stroke: var(--line); stroke-width: 1.5; }
+.evidence-map .map-node:hover rect, .evidence-map .map-node:focus-visible rect { fill: var(--accent-paper); stroke: var(--accent); stroke-width: 2.5; }
+.evidence-map .map-node.is-related rect { fill: var(--accent-paper); stroke: var(--accent); stroke-width: 2.5; }
+.evidence-map .map-node text { fill: var(--ink); font-family: var(--font-evidence); font-size: var(--map-label-size); pointer-events: none; }
+.evidence-map .map-node .map-node-meta { fill: var(--ink-muted); font-size: var(--map-meta-size); }
+.evidence-map .map-unresolved { fill: var(--map-edge-mismatch); stroke: var(--map-edge-mismatch); }
+.evidence-map .map-unresolved-label { fill: var(--ink-muted); font-family: var(--font-evidence); font-size: var(--map-meta-size); }
+.manual-groups { display: grid; gap: var(--space-4); margin-top: var(--space-3); }
+.manual-group { border-top: var(--rule) solid var(--line); padding-top: var(--space-3); }
+.manual-group h4 { margin: 0; font-family: var(--font-evidence); color: var(--ink-muted); }
+.manual-group .plain-list { margin-top: var(--space-2); }
+.repair-existing { color: var(--ink-muted); }
 .relationship-list { padding: 0; list-style: none; }
 .relationship { border-top: var(--rule) solid var(--line); padding: var(--space-4); }
 .relationship p { overflow-wrap: anywhere; }
@@ -199,6 +231,7 @@ footer p + p { margin: 0; }
   .evidence-detail { padding-left: var(--space-4); }
   .evidence-detail dl { grid-template-columns: minmax(0, 1fr); gap: var(--space-2); }
   .evidence-detail dd { margin-bottom: var(--space-3); }
+  .evidence-map svg { min-width: var(--map-min-width); }
   .pagination { flex-wrap: wrap; }
   .patch { padding: var(--space-4); }
   footer { flex-direction: column; gap: var(--space-3); }

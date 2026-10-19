@@ -27,6 +27,52 @@
   const compare = (left, right) => left < right ? -1 : left > right ? 1 : 0;
   const location = (item) => text(item.file) + (item.line == null ? "" : ":" + text(item.line));
   const downloads = new Map();
+  const lanes = ["Documentation", "Build & runtime", "Automation", "Source & other"];
+  const repairCategoryOrder = ["license", "runtime", "container", "lockfile", "test", "machine-specific", "score-protection", "other"];
+  const repairCategoryLabels = {
+    license: "License decision",
+    runtime: "Runtime choice",
+    container: "Container setup",
+    lockfile: "Lockfiles",
+    test: "Tests and verification",
+    "machine-specific": "Machine-specific paths",
+    "score-protection": "Score protection",
+    other: "Other review",
+  };
+
+  const svgNode = (tag, attributes = {}, value) => {
+    const element = document.createElementNS("http://www.w3.org/2000/svg", tag);
+    Object.entries(attributes).forEach(([name, attribute]) => element.setAttribute(name, text(attribute)));
+    if (value !== undefined) element.textContent = text(value);
+    return element;
+  };
+
+  const shorten = (value, limit) => {
+    const source = text(value);
+    return source.length > limit ? source.slice(0, Math.max(0, limit - 1)) + "…" : source;
+  };
+
+  const laneFor = (path) => {
+    const lower = text(path).toLowerCase();
+    if (lower.startsWith(".github/") || /(^|\/)(ci|workflows)\//.test(lower)) return 2;
+    if (/(readme|contributing|license|^docs\/)/.test(lower)) return 0;
+    if (/(dockerfile|makefile|lock|package\.json|pyproject|requirements|version|\.nvmrc|\.env)/.test(lower)) return 1;
+    return 3;
+  };
+
+  const repairCategory = (item) => {
+    const supplied = text(item.category || "").trim().toLowerCase();
+    if (repairCategoryOrder.includes(supplied)) return supplied;
+    const haystack = (text(item.file) + " " + text(item.message) + " " + text(item.reason)).toLowerCase();
+    if (/license|copyright/.test(haystack)) return "license";
+    if (/runtime|python|node|version|pin/.test(haystack)) return "runtime";
+    if (/docker|container/.test(haystack)) return "container";
+    if (/lockfile|lock file|lockfiles/.test(haystack)) return "lockfile";
+    if (/test|verification/.test(haystack)) return "test";
+    if (/machine|absolute path|machine-specific/.test(haystack)) return "machine-specific";
+    if (/score|lower the score|regress/.test(haystack)) return "score-protection";
+    return "other";
+  };
 
   function download(id, content, type) {
     const link = byId(id);
@@ -127,20 +173,58 @@
 
   function renderRepair() {
     const repair = current().repair;
-    byId("repair-projection").textContent = repair
-      ? "Before: " + text(repair.score_before) + " / Projected: " + text(repair.score_after)
-      : "No repair plan was included in this view.";
-    fillList(byId("repair-operations"), repair ? (repair.operations || []).map((item) =>
-      text(item.action) + " " + text(item.path) + " — " + text(item.reason)) : [], "No automatic repair operations were proposed.");
+    if (!repair) {
+      byId("repair-projection").textContent = "No repair plan was included in this view.";
+      fillList(byId("repair-operations"), [], "No safe create operations were proposed.");
+      fillList(byId("repair-existing"), [], "No existing files were carried forward in this view.");
+    } else {
+      const delta = repair.score_delta == null
+        ? Number(repair.score_after) - Number(repair.score_before)
+        : repair.score_delta;
+      const numericDelta = Number(delta);
+      const deltaText = Number.isFinite(numericDelta) ? (numericDelta > 0 ? "+" : "") + text(numericDelta) : "not supplied";
+      byId("repair-projection").textContent = "Before: " + text(repair.score_before)
+        + " / Projected: " + text(repair.score_after) + " / Projected delta: " + deltaText;
+      const operations = repair.operations || [];
+      fillList(byId("repair-operations"), operations.filter((item) => item.action === "create").map((item) =>
+        text(item.path) + " — " + text(item.reason)), "No safe create operations were proposed.");
+      const existing = repair.existing || operations.filter((item) => item.action === "skip-existing");
+      fillList(byId("repair-existing"), existing.map((item) =>
+        text(item.path) + " — " + text(item.reason)), "No existing files were carried forward in this view.");
+    }
     const patch = repair && repair.patch;
     byId("repair-patch").textContent = patch || "";
     byId("repair-patch").hidden = !patch;
     byId("patch-empty").hidden = Boolean(patch);
     byId("patch-empty").textContent = "No downloadable patch was proposed for this view.";
     download("download-patch", patch, "text/plain;charset=utf-8");
-    fillList(byId("manual-notes"), repair ? (repair.manual || []).map((item) =>
-      text(item.file) + " — " + text(item.message) + " / Related: " + ((item.related_files || []).join(", ") || "none")) : [],
-    "No manual repair notes were included.");
+    const manual = repair ? (repair.manual || []) : [];
+    const manualContainer = byId("manual-notes");
+    manualContainer.replaceChildren();
+    if (!manual.length) {
+      manualContainer.append(node("p", "No remaining manual blockers were included.", "empty"));
+    } else {
+      const grouped = new Map();
+      manual.forEach((item) => {
+        const category = repairCategory(item);
+        if (!grouped.has(category)) grouped.set(category, []);
+        grouped.get(category).push(item);
+      });
+      repairCategoryOrder.filter((category) => grouped.has(category)).forEach((category) => {
+        const group = node("section", undefined, "manual-group");
+        group.setAttribute("aria-labelledby", "manual-group-title-" + category);
+        const heading = node("h4", repairCategoryLabels[category]);
+        heading.id = "manual-group-title-" + category;
+        const notes = node("ul", undefined, "plain-list");
+        grouped.get(category).slice().sort((left, right) =>
+          compare(text(left.file) + text(left.message), text(right.file) + text(right.message))).forEach((item) => {
+            notes.append(node("li", text(item.file) + " — " + text(item.message)
+              + " / Related: " + ((item.related_files || []).join(", ") || "none")));
+          });
+        group.append(heading, notes);
+        manualContainer.append(group);
+      });
+    }
     fillList(byId("repair-limits"), repair ? repair.limitations || [] : [], "No additional repair limitations were supplied.");
   }
 
@@ -209,6 +293,109 @@
     if (focused) focused.focus({preventScroll: true});
   }
 
+  function renderEvidenceMap(facts, edges) {
+    const container = byId("evidence-map");
+    container.replaceChildren();
+    if (!facts.length) {
+      container.append(node("p", "No evidence records were included; there is no visual map to trace.", "empty"));
+      return;
+    }
+
+    const laneWidth = 220;
+    const laneGap = 20;
+    const margin = 24;
+    const headerHeight = 38;
+    const nodeHeight = 52;
+    const rowGap = 14;
+    const width = margin * 2 + lanes.length * laneWidth + (lanes.length - 1) * laneGap;
+    const groups = lanes.map((_label, laneIndex) => facts.filter((item) => laneFor(item.file) === laneIndex)
+      .slice().sort((left, right) => compare(text(left.file) + "\u0000" + text(left.id), text(right.file) + "\u0000" + text(right.id))));
+    const rows = Math.max(1, ...groups.map((items) => items.length));
+    const height = margin + headerHeight + rows * nodeHeight + Math.max(0, rows - 1) * rowGap + margin;
+    const svg = svgNode("svg", {
+      viewBox: "0 0 " + width + " " + height,
+      role: "group",
+      "aria-labelledby": "evidence-map-svg-title evidence-map-svg-description",
+    });
+    svg.append(
+      svgNode("title", {id: "evidence-map-svg-title"}, "Visual evidence map"),
+      svgNode("desc", {id: "evidence-map-svg-description"},
+        text(facts.length) + " evidence records and " + text(edges.length)
+        + " precomputed relationships. Selected chains are highlighted in blue.")
+    );
+    const coordinates = new Map();
+    groups.forEach((items, laneIndex) => {
+      const x = margin + laneIndex * (laneWidth + laneGap);
+      const label = svgNode("text", {x: x, y: margin + 14, class: "map-lane-label"}, lanes[laneIndex]);
+      const rule = svgNode("line", {x1: x, y1: margin + 24, x2: x + laneWidth, y2: margin + 24, class: "map-lane-rule"});
+      svg.append(label, rule);
+      items.forEach((item, itemIndex) => {
+        coordinates.set(item.id, {
+          x,
+          y: margin + headerHeight + itemIndex * (nodeHeight + rowGap),
+          width: laneWidth,
+          height: nodeHeight,
+        });
+      });
+    });
+
+    const edgeLayer = svgNode("g", {"aria-hidden": "true"});
+    const unresolved = [];
+    edges.forEach((edge) => {
+      const source = coordinates.get(edge.source);
+      if (!source) return;
+      const target = edge.target == null ? null : coordinates.get(edge.target);
+      const startX = source.x + source.width;
+      const startY = source.y + source.height / 2;
+      const endX = target ? target.x : width - margin;
+      const endY = target ? target.y + target.height / 2 : startY;
+      const bend = Math.max(18, Math.abs(endX - startX) / 2);
+      const path = svgNode("path", {
+        d: "M " + startX + " " + startY + " C " + (startX + bend) + " " + startY + ", "
+          + (endX - bend) + " " + endY + ", " + endX + " " + endY,
+        class: "map-edge map-edge-" + text(edge.status || "unknown")
+          + (state.selected.has(edge.source) || (edge.target && state.selected.has(edge.target)) ? " is-related" : ""),
+      });
+      edgeLayer.append(path);
+      if (!target) unresolved.push({x: endX, y: endY, related: state.selected.has(edge.source)});
+    });
+    svg.append(edgeLayer);
+    unresolved.forEach((point) => {
+      svg.append(
+        svgNode("circle", {cx: point.x, cy: point.y, r: 5, class: "map-unresolved"}),
+        svgNode("text", {x: point.x - 4, y: point.y - 9, class: "map-unresolved-label"}, "?")
+      );
+    });
+
+    groups.forEach((items) => items.forEach((item) => {
+      const point = coordinates.get(item.id);
+      const related = state.selected.has(item.id);
+      const group = svgNode("g", {
+        class: "map-node" + (related ? " is-related" : ""),
+        role: "button",
+        tabindex: "0",
+        "aria-label": location(item) + ", " + text(item.kind) + ", " + text(item.subject),
+        "aria-pressed": String(related),
+      });
+      group.append(
+        svgNode("title", {}, location(item) + " / " + text(item.kind) + " / " + text(item.subject)),
+        svgNode("rect", {x: point.x, y: point.y, width: point.width, height: point.height, rx: 3}),
+        svgNode("text", {x: point.x + 10, y: point.y + 20}, shorten(location(item), 31)),
+        svgNode("text", {x: point.x + 10, y: point.y + 38, class: "map-node-meta"}, shorten(text(item.kind) + " / " + text(item.subject), 31))
+      );
+      const activate = () => selectEvidence([item.id], {record: item.id});
+      group.addEventListener("click", activate);
+      group.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          activate();
+        }
+      });
+      svg.append(group);
+    }));
+    container.append(svg);
+  }
+
   function renderGraph() {
     const facts = evidence();
     const diagnostics = byId("diagnostic-list");
@@ -217,7 +404,7 @@
       const button = node("button", undefined, "diagnostic-button");
       button.id = "diagnostic-" + index;
       button.type = "button";
-      button.setAttribute("aria-controls", "file-schematic evidence-rows");
+      button.setAttribute("aria-controls", "file-schematic evidence-map evidence-rows");
       button.setAttribute("aria-pressed", String(state.diagnostic === index));
       button.append(node("span", text(item.code) + " / " + text(item.severity), "mono"), node("span", item.message),
         node("small", "Related checks: " + ((item.related_checks || []).join(", ") || "none supplied")));
@@ -237,19 +424,11 @@
 
     const schematic = byId("file-schematic");
     schematic.replaceChildren();
-    const lanes = ["Documentation", "Build & runtime", "Automation", "Source & other"];
     const files = new Map();
     facts.forEach((item) => {
       if (!files.has(item.file)) files.set(item.file, []);
       files.get(item.file).push(item);
     });
-    const laneFor = (path) => {
-      const lower = text(path).toLowerCase();
-      if (lower.startsWith(".github/") || /(^|\/)(ci|workflows)\//.test(lower)) return 2;
-      if (/(readme|contributing|license|^docs\/)/.test(lower)) return 0;
-      if (/(dockerfile|makefile|lock|package\.json|pyproject|requirements|version|\.nvmrc|\.env)/.test(lower)) return 1;
-      return 3;
-    };
     lanes.forEach((label, laneIndex) => {
       const entries = Array.from(files).filter(([path]) => laneFor(path) === laneIndex).sort(([a], [b]) => compare(a, b));
       if (!entries.length) return;
@@ -269,6 +448,8 @@
       schematic.append(lane);
     });
     if (!facts.length) schematic.append(node("p", "No file evidence was included; there is no schematic to trace.", "empty"));
+
+    renderEvidenceMap(facts, graph().edges || []);
 
     const relationships = byId("relationship-list");
     relationships.replaceChildren();
