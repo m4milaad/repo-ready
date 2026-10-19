@@ -4,6 +4,7 @@ import struct
 from pathlib import Path
 
 from repo_ready.tracked import inspect_tracked
+from repo_ready.context import RepoContext
 
 
 def _index(paths: tuple[str, ...], *, version: int = 2) -> bytes:
@@ -46,3 +47,15 @@ def test_missing_git_index_is_explicit(tmp_path: Path) -> None:
 
     assert result.safe is False
     assert any(item["code"] == "TR008" for item in result.findings)
+
+
+def test_context_can_limit_index_to_tracked_paths(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "index").write_bytes(_index(("tracked.txt",)))
+    (tmp_path / "tracked.txt").write_text("tracked", encoding="utf-8")
+    (tmp_path / "local.txt").write_text("local", encoding="utf-8")
+
+    tracked = inspect_tracked(tmp_path)
+    context = RepoContext(tmp_path, include_paths=(item.path for item in tracked.files))
+
+    assert [entry.path for entry in context] == ["tracked.txt"]

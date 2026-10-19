@@ -125,6 +125,7 @@ class RepoContext:
         max_file_bytes: int = MAX_FILE_BYTES,
         max_files: int | None = None,
         max_total_bytes: int | None = None,
+        include_paths: Iterable[str | Path] | None = None,
     ) -> None:
         candidate = Path(root).expanduser()
         try:
@@ -135,6 +136,7 @@ class RepoContext:
         self.max_file_bytes = max(0, int(max_file_bytes))
         self.max_files = None if max_files is None else max(0, int(max_files))
         self.max_total_bytes = None if max_total_bytes is None else max(0, int(max_total_bytes))
+        self.include_paths = None if include_paths is None else frozenset(_posix_path(path) for path in include_paths)
         self._truncated = False
         self._truncation_reasons: set[str] = set()
         self._observed_files = 0
@@ -251,6 +253,11 @@ class RepoContext:
             relative = _posix_path(relative)
             if self.is_excluded(relative):
                 continue
+            if self.include_paths is not None and not any(
+                candidate == relative or candidate.startswith(relative + "/")
+                for candidate in self.include_paths
+            ):
+                continue
             try:
                 if item.is_symlink():
                     continue
@@ -269,6 +276,8 @@ class RepoContext:
             if self.max_total_bytes is not None and self._observed_bytes + size > self.max_total_bytes:
                 self._mark_truncated("max_total_bytes")
                 return
+            if self.include_paths is not None and relative not in self.include_paths:
+                continue
             too_large = size > self.max_file_bytes
             binary = False
             if not too_large:

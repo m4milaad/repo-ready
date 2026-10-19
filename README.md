@@ -65,6 +65,7 @@ repo-ready check .
 repo-ready check ./some-repository --json
 repo-ready check . --min-score 80 --no-color
 repo-ready diagnose . --json
+repo-ready check . --scope tracked --json
 ```
 
 JSON output has stable keys and sorted checks/findings for CI. It is written to
@@ -148,6 +149,10 @@ repo-ready tracked . --json
 The normal `check` command remains a filesystem scan. `tracked` is an explicit
 scope report and identifies malformed or unavailable Git indexes rather than
 silently treating them as a complete tracked tree.
+
+`check --scope tracked` uses the same readiness report schema while restricting
+the indexed files to paths recorded in the Git index. It fails clearly when a
+readable Git index is unavailable.
 
 ### Exit codes
 

@@ -38,6 +38,7 @@ def _parser() -> argparse.ArgumentParser:
     check.add_argument("path", nargs="?", type=Path, default=None)
     check.add_argument("--json", action="store_true", dest="as_json")
     check.add_argument("--format", choices=("text", "json", "markdown", "sarif"), default=None)
+    check.add_argument("--scope", choices=("filesystem", "tracked"), default="filesystem")
     check.add_argument("--min-score", type=int, default=None)
     check.add_argument("--no-color", action="store_true")
 
@@ -123,7 +124,14 @@ def _print_human_report(result: dict[str, object], *, no_color: bool = False) ->
 
 
 def _run_check(args: argparse.Namespace, repository: Path) -> int:
-    result = report(args.path)
+    include_paths = None
+    if args.scope == "tracked":
+        tracked = inspect_tracked(repository)
+        if tracked.index_version is None:
+            raise ConfigError("tracked scope requires a readable Git index")
+        include_paths = (item.path for item in tracked.files)
+    context = RepoContext(repository, include_paths=include_paths)
+    result = report(args.path, context=context)
     output_format = "json" if args.as_json else (args.format or "text")
     if output_format == "json":
         print(json.dumps(result, indent=2))
@@ -133,7 +141,6 @@ def _run_check(args: argparse.Namespace, repository: Path) -> int:
         print(render_sarif(result))
     else:
         _print_human_report(result, no_color=args.no_color)
-    context = RepoContext(repository)
     threshold = args.min_score if args.min_score is not None else context.min_score
     if threshold is not None and int(result["score"]) < threshold:
         return 1
