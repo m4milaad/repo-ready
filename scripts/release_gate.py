@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -28,11 +29,20 @@ def _command(*parts: str) -> list[str]:
     return [sys.executable, *parts]
 
 
-def _run(command: list[str], *, cwd: Path, env: dict[str, str] | None = None) -> None:
+def _run(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str] | None = None,
+    with_source: bool = True,
+) -> None:
     print("release gate: $ " + " ".join(command))
     process_env = dict(os.environ) if env is None else dict(env)
-    existing_pythonpath = process_env.get("PYTHONPATH")
-    process_env["PYTHONPATH"] = str(SRC) + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
+    if with_source:
+        existing_pythonpath = process_env.get("PYTHONPATH")
+        process_env["PYTHONPATH"] = str(SRC) + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
+    else:
+        process_env.pop("PYTHONPATH", None)
     completed = subprocess.run(command, cwd=cwd, env=process_env, check=False)
     if completed.returncode:
         raise ReleaseGateError(f"command failed with exit code {completed.returncode}: {' '.join(command)}")
@@ -44,6 +54,43 @@ def _inspect(path: Path, root: Path) -> None:
         findings = "; ".join(f"{item.code}: {item.detail}" for item in result.findings)
         raise ReleaseGateError(f"artifact is unsafe: {path.name}: {findings}")
     print(f"release gate: artifact safe: {path.name} ({len(result.members)} members)")
+
+
+def _installed_smoke(wheel: Path, root: Path, version: str) -> None:
+    """Install the built wheel into a clean venv and exercise the public CLI."""
+
+    with tempfile.TemporaryDirectory(prefix="repo-ready-installed-") as temporary:
+        environment = Path(temporary) / "venv"
+        _run(_command("-m", "venv", str(environment)), cwd=root, with_source=False)
+        executable_dir = environment / ("Scripts" if os.name == "nt" else "bin")
+        python = executable_dir / ("python.exe" if os.name == "nt" else "python")
+        console = executable_dir / ("repo-ready.exe" if os.name == "nt" else "repo-ready")
+        _run([str(python), "-m", "pip", "install", "--no-index", "--no-deps", str(wheel)], cwd=root, with_source=False)
+        _run([str(python), "-m", "repo_ready", "--version"], cwd=root, with_source=False)
+        _run([str(console), "--version"], cwd=root, with_source=False)
+        _run(
+            [
+                str(python),
+                "-c",
+                "from pathlib import Path; import repo_ready; p=Path(repo_ready.__file__).resolve(); assert 'src' not in p.parts; assert repo_ready.__version__ == " + repr(version),
+            ],
+            cwd=root,
+            with_source=False,
+        )
+        _run(
+            [
+                str(python),
+                "-m",
+                "repo_ready",
+                "showcase",
+                "examples/showcase-demo",
+                "--output",
+                str(Path(temporary) / "installed-report.html"),
+            ],
+            cwd=root,
+            with_source=False,
+        )
+    print("release gate: installed wheel smoke passed")
 
 
 def run_gate(
@@ -81,6 +128,7 @@ def run_gate(
     for artifact in (wheels[0], sdists[0]):
         _inspect(artifact, repository)
     _run(_command("-m", "twine", "check", str(wheels[0]), str(sdists[0])), cwd=repository)
+    _installed_smoke(wheels[0], repository, version)
 
     _run(_command("scripts/showcase_smoke.py"), cwd=repository)
     if not skip_browser:
