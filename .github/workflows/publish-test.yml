@@ -1,0 +1,41 @@
+name: TestPyPI publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Expected package version, for example 0.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install locked release tools
+        run: |
+          python -m pip install -r requirements.lock
+          python -m pip install -r requirements-release.lock
+      - name: Run release gate
+        run: python scripts/release_gate.py "${{ inputs.version }}" --skip-docker --skip-browser --output-dir dist/test-release
+      - name: Publish to TestPyPI with trusted publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: dist/test-release
+      - name: Verify the published CLI
+        run: |
+          python -m venv /tmp/repo-ready-testpypi
+          /tmp/repo-ready-testpypi/bin/python -m pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ "repo-ready==${{ inputs.version }}"
+          /tmp/repo-ready-testpypi/bin/python -m repo_ready --version

@@ -1,10 +1,10 @@
 # repo-ready
 
-`repo-ready` is an offline Python CLI that scores how easy it is for a
-newcomer to set up, run, test, and contribute to a local repository. It
-supports Python and Node projects, reports a deterministic score from 0 to
-100, explains failed checks, and safely scaffolds missing documentation and
-configuration files without overwriting anything.
+`repo-ready` is an offline CLI that scores how easy it is for a newcomer to
+set up, run, test, and contribute to a local repository. It supports Python,
+Node, Go, Rust, .NET, Java/Kotlin, and Ruby projects, reports a deterministic
+score from 0 to 100, explains failed checks, and safely scaffolds missing
+documentation and configuration files without overwriting anything.
 
 ## Live demo
 
@@ -34,6 +34,25 @@ docker run --rm --network none repo-ready python -m pytest -q
 The runtime uses only the Python standard library. `pytest` and its locked
 test-tool dependencies are development dependencies listed in
 `requirements.lock`.
+
+## Supported ecosystems
+
+Ecosystem support is static and offline. Detection uses strong project markers;
+no compiler, package manager, test runner, or project code is executed.
+
+| Ecosystem | Project markers | Lock/runtime evidence | Conventional test command |
+| --- | --- | --- | --- |
+| Python | `pyproject.toml`, `setup.py`, `requirements*.txt` | `uv.lock`, `poetry.lock`, `requirements*.lock`, `.python-version` | `python -m pytest -q` |
+| Node | `package.json` | npm/Yarn/pnpm lockfiles, `.nvmrc` | `npm test` |
+| Go | `go.mod` | `go.sum`, `.go-version`, `go.mod` | `go test ./...` |
+| Rust | `Cargo.toml` | `Cargo.lock`, `rust-toolchain*` | `cargo test` |
+| .NET | `*.sln`, `*.csproj`, `global.json` | `packages.lock.json`, `global.json` | `dotnet test` |
+| Java/Kotlin | `pom.xml`, Gradle files/wrapper | `gradle.lockfile`, `.java-version` | `mvn test` or `./gradlew test` |
+| Ruby | `Gemfile` | `Gemfile.lock`, `.ruby-version` | `bundle exec rake test` |
+
+The same RR01–RR13 score remains a stable 100-point contract across
+ecosystems. Ecosystem-specific evidence is also included in `diagnose` and
+showcase contract graphs.
 
 ## Setup
 
@@ -201,6 +220,31 @@ The artifact report checks member paths, links, duplicate members, size
 limits, required Python distribution metadata, project/version parity, and
 missing source modules. Artifact inspection is independent of readiness
 scoring and uses its own versioned schema.
+
+### Release verification and publishing
+
+Release metadata is validated from the single version source in
+`src/repo_ready/_version.py`:
+
+```sh
+python scripts/release_check.py v0.1.0
+python scripts/release_gate.py v0.1.0 --skip-docker --skip-browser
+```
+
+The release gate builds one wheel and one source distribution, inspects both
+without extraction or execution, runs `twine check`, and verifies the showcase.
+The full gate additionally builds the pinned Docker image and runs the clean
+Linux suite:
+
+```sh
+python scripts/release_gate.py v0.1.0
+```
+
+Tags matching `v*.*.*` are handled by `.github/workflows/release.yml`. The
+workflow uses the locked release tools, produces checksums, publishes through
+PyPI Trusted Publishing, and creates a GitHub release. Configure a PyPI
+trusted publisher for the `pypi` environment before enabling production
+publishing.
 
 ### Tracked-tree scope
 

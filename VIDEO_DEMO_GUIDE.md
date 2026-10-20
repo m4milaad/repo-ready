@@ -258,6 +258,18 @@ make test
 
 On Windows without `make`, use `python -m pytest -q` directly.
 
+For the final submission-quality release pass, run the artifact gate after the
+standard tests:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\release_check.py v0.1.0
+.\.venv\Scripts\python.exe scripts\release_gate.py v0.1.0
+```
+
+The gate verifies the wheel, source distribution, package metadata, showcase,
+browser flow, and clean Docker suite. Use `--skip-docker --skip-browser` only
+when Docker or Chromium is intentionally unavailable.
+
 For clean-room verification with Docker:
 
 ```sh

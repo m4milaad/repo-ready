@@ -13,6 +13,7 @@ from .models import CheckResult, Finding, ScanReport
 from .scoring import build_report, report, scan, scan_repository
 from .showcase import SHOWCASE_SCHEMA_VERSION, analysis_fingerprint, build_showcase
 from .showcase_html import render_showcase
+from .ecosystems import ECOSYSTEM_PROFILES, EcosystemProfile
 
 __all__ = [
     "CheckResult",
@@ -23,6 +24,8 @@ __all__ = [
     "ContractDiagnostic",
     "ContractEdge",
     "ContractGraph",
+    "ECOSYSTEM_PROFILES",
+    "EcosystemProfile",
     "Evidence",
     "FileEntry",
     "OverlayContext",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -11,6 +12,9 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 
 from repo_ready.artifact import inspect_artifact
 from scripts.release_check import ReleaseCheckError, validate_release
@@ -26,7 +30,10 @@ def _command(*parts: str) -> list[str]:
 
 def _run(command: list[str], *, cwd: Path, env: dict[str, str] | None = None) -> None:
     print("release gate: $ " + " ".join(command))
-    completed = subprocess.run(command, cwd=cwd, env=env, check=False)
+    process_env = dict(os.environ) if env is None else dict(env)
+    existing_pythonpath = process_env.get("PYTHONPATH")
+    process_env["PYTHONPATH"] = str(SRC) + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
+    completed = subprocess.run(command, cwd=cwd, env=process_env, check=False)
     if completed.returncode:
         raise ReleaseGateError(f"command failed with exit code {completed.returncode}: {' '.join(command)}")
 
