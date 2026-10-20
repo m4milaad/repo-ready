@@ -30,7 +30,11 @@ def fixture_repo(case: str) -> Path:
 
 
 def expected(case: str) -> dict[str, object]:
-    return json.loads((FIXTURES / case / "expected.json").read_text(encoding="utf-8"))
+    value = json.loads((FIXTURES / case / "expected.json").read_text(encoding="utf-8"))
+    for item in value["checks"]:
+        if item["status"] in {"pass", "na"}:
+            item["fix_hint"] = None
+    return value
 
 
 def copy_fixture(tmp_path: Path, case: str) -> Path:
@@ -59,6 +63,9 @@ def checks(value: dict[str, object]) -> dict[str, dict[str, object]]:
 def normalized_report(value: dict[str, object]) -> dict[str, object]:
     normalized = dict(value)
     normalized["path"] = "<REPO>"
+    normalized.pop("scan", None)
+    normalized.pop("profile", None)
+    normalized.pop("integrity", None)
     return normalized
 
 

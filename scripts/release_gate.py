@@ -61,6 +61,8 @@ def _installed_smoke(wheel: Path, root: Path, version: str) -> None:
 
     with tempfile.TemporaryDirectory(prefix="repo-ready-installed-") as temporary:
         environment = Path(temporary) / "venv"
+        outside = Path(temporary) / "outside-checkout"
+        outside.mkdir()
         _run(_command("-m", "venv", str(environment)), cwd=root, with_source=False)
         executable_dir = environment / ("Scripts" if os.name == "nt" else "bin")
         python = executable_dir / ("python.exe" if os.name == "nt" else "python")
@@ -68,6 +70,11 @@ def _installed_smoke(wheel: Path, root: Path, version: str) -> None:
         _run([str(python), "-m", "pip", "install", "--no-index", "--no-deps", str(wheel)], cwd=root, with_source=False)
         _run([str(python), "-m", "repo_ready", "--version"], cwd=root, with_source=False)
         _run([str(console), "--version"], cwd=root, with_source=False)
+        _run(
+            [str(console), "check", str(root / "examples" / "showcase-demo"), "--json", "--min-score", "0"],
+            cwd=outside,
+            with_source=False,
+        )
         _run(
             [
                 str(python),

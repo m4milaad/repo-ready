@@ -10,7 +10,9 @@ from .artifact import ArtifactFinding, ArtifactMember, ArtifactReport, inspect_a
 from .tracked import TrackedFile, TrackedReport, inspect_tracked
 from .registry import RuleDescriptor, rule_descriptors
 from .models import CheckResult, Finding, ScanReport
-from .scoring import build_report, report, scan, scan_repository
+from .scoring import build_report, report, resolve_profile, scan, scan_repository
+from .inventory import scan_inventory
+from .integrity import inspect_integrity
 from .showcase import SHOWCASE_SCHEMA_VERSION, analysis_fingerprint, build_showcase
 from .showcase_html import render_showcase
 from .ecosystems import ECOSYSTEM_PROFILES, EcosystemProfile
@@ -48,6 +50,9 @@ __all__ = [
     "RuleDescriptor",
     "rule_descriptors",
     "report",
+    "resolve_profile",
+    "scan_inventory",
+    "inspect_integrity",
     "render_showcase",
     "scan",
     "scan_repository",

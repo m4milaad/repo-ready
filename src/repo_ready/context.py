@@ -9,12 +9,14 @@ cheap to ignore consistently.
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import os
+import re
 import stat
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Iterable, Iterator
+from typing import Callable, Iterable, Iterator
 
 
 MAX_FILE_BYTES = 1 * 1024 * 1024
@@ -34,6 +36,7 @@ class ConfigError(ValueError):
 class _RepoConfig:
     excludes: tuple[str, ...] = ()
     min_score: int | None = None
+    external_env: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -126,6 +129,7 @@ class RepoContext:
         max_files: int | None = None,
         max_total_bytes: int | None = None,
         include_paths: Iterable[str | Path] | None = None,
+        progress: Callable[[int, int], None] | None = None,
     ) -> None:
         candidate = Path(root).expanduser()
         try:
@@ -141,8 +145,11 @@ class RepoContext:
         self._truncation_reasons: set[str] = set()
         self._observed_files = 0
         self._observed_bytes = 0
+        self._excluded_files = 0
+        self._progress = progress
         config = self._read_config()
         self.min_score = config.min_score
+        self.external_env = config.external_env
         self.config_excludes = config.excludes
         self.excludes = tuple(
             dict.fromkeys((*DEFAULT_EXCLUDES, *self.config_excludes, *excludes))
@@ -215,7 +222,15 @@ class RepoContext:
             raise ConfigError(
                 ".repo-ready.toml: 'min_score' must be an integer from 0 to 100; booleans are not allowed."
             )
-        return _RepoConfig(tuple(excludes), min_score)
+        external_values = document.get("external_env", [])
+        if not isinstance(external_values, list) or any(
+            not isinstance(value, str) or not re.fullmatch(r"[A-Z_][A-Z0-9_]*", value)
+            for value in external_values
+        ):
+            raise ConfigError(
+                ".repo-ready.toml: 'external_env' must be a list of uppercase variable names."
+            )
+        return _RepoConfig(tuple(excludes), min_score, tuple(dict.fromkeys(external_values)))
 
     def is_excluded(self, relative: str | Path) -> bool:
         path = _posix_path(relative)
@@ -252,6 +267,7 @@ class RepoContext:
             relative = f"{prefix}/{item.name}" if prefix else item.name
             relative = _posix_path(relative)
             if self.is_excluded(relative):
+                self._excluded_files += 1
                 continue
             if self.include_paths is not None and not any(
                 candidate == relative or candidate.startswith(relative + "/")
@@ -305,6 +321,10 @@ class RepoContext:
             found.append(FileEntry(relative, Path(item.path), size, too_large, binary))
             self._observed_files += 1
             self._observed_bytes += size
+            if self._progress is not None and (
+                self._observed_files == 1 or self._observed_files % 100 == 0
+            ):
+                self._progress(self._observed_files, self._observed_bytes)
 
     @property
     def truncated(self) -> bool:
@@ -323,6 +343,24 @@ class RepoContext:
     @property
     def observed_bytes(self) -> int:
         return self._observed_bytes
+
+    @property
+    def excluded_files(self) -> int:
+        """Number of files/directories skipped by configured exclusions."""
+
+        return self._excluded_files
+
+    @property
+    def inventory_fingerprint(self) -> str:
+        """Return a stable digest of the indexed paths and file sizes."""
+
+        digest = hashlib.sha256()
+        for entry in self._entries:
+            digest.update(entry.path.encode("utf-8", "surrogateescape"))
+            digest.update(b"\0")
+            digest.update(str(entry.size).encode("ascii"))
+            digest.update(b"\n")
+        return digest.hexdigest()
 
     @property
     def files(self) -> tuple[FileEntry, ...]:

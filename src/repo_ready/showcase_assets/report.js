@@ -122,7 +122,7 @@
       fillList(findings, (check.findings || []).map((finding) => location(finding) + " — " + text(finding.detail)),
         "No file-level findings for this check.");
       item.append(findings);
-      if (check.fix_hint) item.append(node("p", "Repair hint: " + text(check.fix_hint)));
+      if (!['pass', 'na'].includes(check.status) && check.fix_hint) item.append(node("p", "Repair hint: " + text(check.fix_hint)));
       container.append(item);
     });
   }

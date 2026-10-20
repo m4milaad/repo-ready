@@ -21,8 +21,10 @@ from .baseline import compare_reports
 from .context import RepoContext
 from .contracts import ContractGraph, build_contract_graph
 from .fixer import PlannedFile, plan_fixes
+from .inventory import scan_inventory
+from .integrity import inspect_integrity
 from .overlay import OverlayContext, SnapshotContext, snapshot_context
-from .scoring import report
+from .scoring import report, resolve_profile
 from .tracked import TrackedReport, inspect_tracked
 
 
@@ -109,7 +111,7 @@ def _manual_category(operation: PlannedFile) -> str:
     return "other"
 
 
-def _repair_preview(context: RepoContext, baseline_score: int) -> dict[str, object]:
+def _repair_preview(context: RepoContext, baseline_score: int, profile: str = "legacy") -> dict[str, object]:
     """Preview the existing fixer plan against *context* in memory."""
 
     root = context.root
@@ -139,7 +141,7 @@ def _repair_preview(context: RepoContext, baseline_score: int) -> dict[str, obje
         changes[relative] = operation.content
 
     projected = OverlayContext(context, changes)
-    score_after = int(report(".", context=projected)["score"])
+    score_after = int(report(".", context=projected, profile=profile)["score"])
     limitations = [
         "Only fixer operations with action=create are scored in the in-memory overlay.",
         "A proposed repair is not a verified build or test run.",
@@ -157,10 +159,10 @@ def _repair_preview(context: RepoContext, baseline_score: int) -> dict[str, obje
     }
 
 
-def _stable_report(context: RepoContext) -> dict[str, object]:
+def _stable_report(context: RepoContext, profile: str = "legacy") -> dict[str, object]:
     """Return a report whose path does not leak the caller's absolute root."""
 
-    result = dict(report(".", context=context))
+    result = dict(report(".", context=context, profile=profile))
     result["path"] = "."
     return result
 
@@ -263,6 +265,12 @@ def _workflow_drift_change(context: RepoContext) -> tuple[list[dict[str, str]], 
     ]
     workflow_entries.sort(key=lambda entry: entry.path)
     field_pattern = re.compile(rf"(?m)^(\s*(?:-\s+)?{re.escape(field)}\s*:\s*)([^#\r\n]+)")
+    observed: set[str] = set()
+    for entry in workflow_entries:
+        text = context.read_text(entry)
+        if text is None:
+            continue
+        observed.update(match.group(2).strip().strip("\"'") for match in field_pattern.finditer(text))
     for entry in workflow_entries:
         text = context.read_text(entry)
         if text is None:
@@ -271,7 +279,20 @@ def _workflow_drift_change(context: RepoContext) -> tuple[list[dict[str, str]], 
         if match is None:
             continue
         old = match.group(2).strip().strip("\"'")
-        drift = _drift_version(runtime_value or old, node=ecosystem == "node")
+        candidates = [_drift_version(runtime_value or old, node=ecosystem == "node")]
+        if ecosystem == "node":
+            candidates.extend(("20", "21", "22", "18"))
+        else:
+            candidates.extend(("3.13", "3.10", "3.9", "3.14"))
+        drift = next(
+            (
+                candidate for candidate in candidates
+                if candidate != old and candidate != (runtime_value or "") and candidate not in observed
+            ),
+            None,
+        )
+        if drift is None:
+            return None
         replacement = match.group(1) + match.group(2).replace(old, drift, 1)
         virtual = text[: match.start()] + replacement + text[match.end() :]
         return (
@@ -431,10 +452,18 @@ def _available(
     baseline_report: dict[str, object],
     baseline_graph: ContractGraph,
     context: SnapshotContext,
+    profile: str,
 ) -> dict[str, object]:
     overlay = OverlayContext(context, virtual_changes)
-    scenario_report = _stable_report(overlay)
+    scenario_report = _stable_report(overlay, profile)
     scenario_graph = build_contract_graph(overlay)
+    if scenario_report == baseline_report and scenario_graph == baseline_graph:
+        return _unavailable(
+            identifier,
+            label,
+            description,
+            "The proposed mutation did not change the static report or contract graph.",
+        )
     comparison = compare_reports(baseline_report, scenario_report)
     added, resolved = _diagnostic_delta(baseline_graph, scenario_graph)
     affected = sorted({item["path"] for item in changes})
@@ -452,7 +481,7 @@ def _available(
         "new_diagnostics": added,
         "resolved_diagnostics": resolved,
         "affected_files": affected,
-        "repair": _repair_preview(overlay, int(scenario_report["score"])),
+        "repair": _repair_preview(overlay, int(scenario_report["score"]), profile),
     }
 
 
@@ -465,17 +494,19 @@ def _scenario(
     baseline_graph: ContractGraph,
     context: SnapshotContext,
     unavailable_reason: str,
+    profile: str,
 ) -> dict[str, object]:
     if proposal is None:
         return _unavailable(identifier, label, description, unavailable_reason)
     changes, virtual, _detail = proposal
-    return _available(identifier, label, description, changes, virtual, baseline_report, baseline_graph, context)
+    return _available(identifier, label, description, changes, virtual, baseline_report, baseline_graph, context, profile)
 
 
 def _scenario_list(
     context: SnapshotContext,
     baseline_report: dict[str, object],
     baseline_graph: ContractGraph,
+    profile: str,
 ) -> list[dict[str, object]]:
     runtime = _runtime_pin_change(context)
     dependency = _dependency_file_change(context, baseline_graph)
@@ -490,6 +521,7 @@ def _scenario_list(
             baseline_graph,
             context,
             "No explicit runtime pin was observed.",
+            profile,
         ),
         _scenario(
             "ci-runtime-drift",
@@ -500,6 +532,7 @@ def _scenario_list(
             baseline_graph,
             context,
             "No explicit runtime pin was observed for a CI/runtime comparison.",
+            profile,
         ),
         _scenario(
             "remove-referenced-dependency-file",
@@ -510,6 +543,7 @@ def _scenario_list(
             baseline_graph,
             context,
             "No readable dependency file explicitly referenced by an install command was observed.",
+            profile,
         ),
         _scenario(
             "remove-test-entry-point",
@@ -520,25 +554,32 @@ def _scenario_list(
             baseline_graph,
             context,
             "No statically discoverable project test entry point was observed.",
+            profile,
         ),
     ]
 
 
 def _scope_context(root: str | Path, scope: str) -> tuple[RepoContext, TrackedReport | None]:
-    if scope not in {"filesystem", "tracked"}:
-        raise ValueError("scope must be 'filesystem' or 'tracked'")
+    if scope not in {"auto", "filesystem", "tracked"}:
+        raise ValueError("scope must be 'auto', 'filesystem', or 'tracked'")
     tracked: TrackedReport | None = None
     include_paths = None
-    if scope == "tracked":
+    if scope in {"auto", "tracked"}:
         tracked = inspect_tracked(root)
-        include_paths = (item.path for item in tracked.files)
+        if scope == "tracked" and tracked.index_version is None:
+            raise ValueError("tracked scope requires a readable Git index")
+        if tracked.index_version is None:
+            tracked = None
+        else:
+            include_paths = (item.path for item in tracked.files)
     return RepoContext(root, include_paths=include_paths), tracked
 
 
 def build_showcase(
     root: str | Path,
-    scope: str = "filesystem",
+    scope: str = "auto",
     scenarios: bool = True,
+    profile: str = "auto",
 ) -> dict[str, object]:
     """Build the version-1 JSON-serializable static showcase payload.
 
@@ -550,12 +591,15 @@ def build_showcase(
 
     if not isinstance(scenarios, bool):
         raise TypeError("scenarios must be a bool")
+    if profile not in {"auto", "legacy", "library", "web-app", "containerized-service", "monorepo"}:
+        raise ValueError(f"unknown scoring profile: {profile}")
     live, tracked = _scope_context(root, scope)
+    effective_scope = "tracked" if tracked is not None else "filesystem"
     frozen = snapshot_context(live)
-    baseline_report = _stable_report(frozen)
+    baseline_report = _stable_report(frozen, profile)
     baseline_graph = build_contract_graph(frozen)
     baseline_score = int(baseline_report["score"])
-    repair = _repair_preview(frozen, baseline_score)
+    repair = _repair_preview(frozen, baseline_score, profile)
 
     limitations = list(_STATIC_LIMITATIONS)
     limitations.extend(f"Snapshot limitation: {item}" for item in frozen.limitations)
@@ -573,9 +617,19 @@ def build_showcase(
         "mode": "static",
         "repository": {
             "name": frozen.root.name or "repository",
-            "scope": scope,
+            "scope": effective_scope,
+            "requested_scope": scope,
+            "profile": resolve_profile(frozen, profile),
+            "effective_scope": effective_scope,
             "files": len(frozen.files),
             "complete": complete,
+            "inventory": scan_inventory(
+                frozen,
+                requested_scope=scope,
+                effective_scope=effective_scope,
+                tracked=tracked,
+            ),
+            "integrity": inspect_integrity(frozen, tracked),
         },
         "limitations": sorted(set(limitations)),
         "baseline": {
@@ -583,7 +637,7 @@ def build_showcase(
             "graph": baseline_graph.as_dict(),
             "repair": repair,
         },
-        "scenarios": _scenario_list(frozen, baseline_report, baseline_graph) if scenarios else [],
+            "scenarios": _scenario_list(frozen, baseline_report, baseline_graph, profile) if scenarios else [],
     }
     return {
         "schema_version": SHOWCASE_SCHEMA_VERSION,

@@ -43,7 +43,7 @@ no compiler, package manager, test runner, or project code is executed.
 | Ecosystem | Project markers | Lock/runtime evidence | Conventional test command |
 | --- | --- | --- | --- |
 | Python | `pyproject.toml`, `setup.py`, `requirements*.txt` | `uv.lock`, `poetry.lock`, `requirements*.lock`, `.python-version` | `python -m pytest -q` |
-| Node | `package.json` | npm/Yarn/pnpm lockfiles, `.nvmrc` | `npm test` |
+| Node | `package.json` | npm/Yarn/pnpm/Bun lockfiles, `.nvmrc` | `npm test` |
 | Go | `go.mod` | `go.sum`, `.go-version`, `go.mod` | `go test ./...` |
 | Rust | `Cargo.toml` | `Cargo.lock`, `rust-toolchain*` | `cargo test` |
 | .NET | `*.sln`, `*.csproj`, `global.json` | `packages.lock.json`, `global.json` | `dotnet test` |
@@ -55,6 +55,23 @@ ecosystems. Ecosystem-specific evidence is also included in `diagnose` and
 showcase contract graphs.
 
 ## Setup
+
+### Install for everyday use
+
+`repo-ready` is a normal Python package. After a release is published, install
+it once into a user or project virtual environment; you do not install
+anything inside each repository that you inspect:
+
+```sh
+python3.12 -m venv ~/.venvs/repo-ready
+. ~/.venvs/repo-ready/bin/activate
+python -m pip install repo-ready
+cd /path/to/another-repository
+repo-ready check .
+```
+
+The command scans the current repository without executing its code, installing
+its dependencies, or using the network.
 
 ### Local installation
 
@@ -69,7 +86,8 @@ python -m pip install -r requirements.lock
 python -m pip install --no-build-isolation -e .
 ```
 
-The editable install makes both invocation styles available:
+The editable install is only for contributors developing `repo-ready` itself;
+it makes both invocation styles available:
 
 ```sh
 repo-ready check .
@@ -118,7 +136,32 @@ repo-ready check ./some-repository --json
 repo-ready check . --min-score 80 --no-color
 repo-ready diagnose . --json
 repo-ready check . --scope tracked --json
+repo-ready check . --scope auto --profile auto
+repo-ready check . --no-progress
 ```
+
+`--scope auto` uses the Git index when available and otherwise scans the
+filesystem. `--scope filesystem` and `--scope tracked` remain available when
+you need an explicit choice. Interactive scans show progress and elapsed time
+on stderr; JSON stays machine-readable on stdout. `--profile auto` avoids
+penalizing projects that clearly deploy through a native platform instead of a
+container. Use `--profile legacy` for the original fixed Docker scoring rule.
+
+The JSON report includes a reproducible scan inventory and separate repository
+integrity observations. Integrity observations (such as tracked build output,
+multiple lockfiles, or large tracked files) do not silently change the
+readiness score.
+
+Projects may add repository-specific scan settings in `.repo-ready.toml`:
+
+```toml
+exclude = ["generated", "fixtures/large-data"]
+external_env = ["COMPANY_SSO_URL", "DEPLOYMENT_REGION"]
+min_score = 80
+```
+
+`external_env` documents variables intentionally supplied by a deployment
+platform or organization rather than by a checked-in example file.
 
 JSON output has stable keys and sorted checks/findings for CI. It is written to
 standard output, so it can be saved or passed to another tool:

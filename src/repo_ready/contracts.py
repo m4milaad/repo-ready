@@ -24,6 +24,7 @@ from .checks import (
     _dockerfile_instructions,
     _lock_paths,
     _root_dockerfile,
+    _heading_key,
     _text,
     _validate_lock,
 )
@@ -270,14 +271,19 @@ def _collect_readme(context: RepoContext, evidence: list[Evidence]) -> None:
         return
     path, text = selected
     headings: list[tuple[int, str]] = []
-    for number, line in enumerate(text.splitlines(), 1):
+    readme_lines = text.splitlines()
+    for number, line in enumerate(readme_lines, 1):
         match = re.match(r"^\s*#{1,6}\s+(.+?)\s*#*\s*$", line)
         if match:
-            headings.append((number, match.group(1).strip().casefold()))
-    sections = {"test", "testing", "run", "usage", "requirements", "runtime", "setup", "install", "installation", "rebuild", "deploy"}
-    lines = text.splitlines()
+            headings.append((number, _heading_key(match.group(1))))
+        elif number < len(readme_lines) and line.strip() and re.fullmatch(r"\s*(?:=+|-+)\s*", readme_lines[number]):
+            headings.append((number, _heading_key(line)))
+    sections = {"test", "testing", "run", "usage", "requirements", "runtime", "setup", "install", "installation", "rebuild", "deploy", "getting started", "installation development", "development", "build deploy", "quality"}
+    lines = readme_lines
     for index, (start, title) in enumerate(headings):
-        if title not in sections:
+        if title not in sections and not any(
+            token in title for token in ("setup", "install", "usage", "run", "test", "deploy", "develop", "quality", "getting started")
+        ):
             continue
         end = headings[index + 1][0] - 1 if index + 1 < len(headings) else len(lines)
         for number in range(start, end + 1):
@@ -295,7 +301,7 @@ def _collect_readme(context: RepoContext, evidence: list[Evidence]) -> None:
                     attributes=_attrs(source="readme", section=title, family=family),
                 )
             stripped = lines[number - 1].strip()
-            if title in {"requirements", "runtime"}:
+            if title in {"requirements", "runtime"} or "requirement" in title or "runtime" in title:
                 runtime = _runtime_version(stripped, node="node" in stripped.casefold())
                 if runtime:
                     ecosystem = "node" if "node" in stripped.casefold() else "python"
@@ -491,7 +497,7 @@ def _collect_manifests(context: RepoContext, ecosystems: tuple[str, ...], eviden
                         )
 
     for entry in context:
-        if not re.fullmatch(r"requirements(?:-[^/]+)?\.txt", entry.path):
+        if not re.fullmatch(r"(?:[^/]+/)*requirements(?:-[^/]+)?\.txt", entry.path):
             continue
         text = context.read_text(entry)
         if text is None:
@@ -577,6 +583,33 @@ def _collect_workflows(context: RepoContext, evidence: list[Evidence]) -> None:
         if text is None:
             continue
         lines = text.splitlines()
+        run_directories: dict[int, str] = {}
+        prior_directories: list[tuple[int, int, str]] = []
+        for index, candidate_line in enumerate(lines):
+            directory_match = re.match(r"^(\s*)working-directory:\s*([^#\r\n]+)", candidate_line)
+            if directory_match:
+                prior_directories.append((index, len(directory_match.group(1)), directory_match.group(2).strip().strip("\"'")))
+            run_match = re.match(r"^(\s*)(?:-\s+)?run:\s*", candidate_line)
+            if not run_match:
+                continue
+            run_indent_value = len(run_match.group(1))
+            selected = next(
+                (
+                    value for prior_index, indent_value, value in reversed(prior_directories)
+                    if prior_index < index and indent_value < run_indent_value
+                ),
+                None,
+            )
+            for follow_index in range(index + 1, len(lines)):
+                follow = lines[follow_index]
+                follow_indent = len(follow) - len(follow.lstrip())
+                if follow.strip() and follow_indent <= run_indent_value and follow.lstrip().startswith("-"):
+                    break
+                follow_directory = re.match(r"^\s*working-directory:\s*([^#\r\n]+)", follow)
+                if follow_directory:
+                    selected = follow_directory.group(1).strip().strip("\"'")
+            if selected:
+                run_directories[index + 1] = selected
         in_run_block = False
         run_indent = 0
         steps_indent: int | None = None
@@ -651,6 +684,7 @@ def _collect_workflows(context: RepoContext, evidence: list[Evidence]) -> None:
             candidate = run.group(1).strip().strip("\"'") if run else stripped
             if in_run_block or run:
                 command = _command_from_line(candidate)
+                working_directory = run_directories.get(number)
                 if command:
                     family, value = command
                     _add_evidence(
@@ -661,7 +695,7 @@ def _collect_workflows(context: RepoContext, evidence: list[Evidence]) -> None:
                         line=number,
                         value=value,
                         normalized=family,
-                        attributes=_attrs(source="workflow", family=family),
+                        attributes=_attrs(source="workflow", family=family, **({"working-directory": working_directory} if working_directory else {})),
                     )
                 if _INSTALL_COMMANDS.search(_normalize_command(candidate)):
                     _add_evidence(
@@ -672,7 +706,7 @@ def _collect_workflows(context: RepoContext, evidence: list[Evidence]) -> None:
                         line=number,
                         value=_normalize_command(candidate),
                         normalized="install",
-                        attributes=_attrs(source="workflow", family="install"),
+                        attributes=_attrs(source="workflow", family="install", **({"working-directory": working_directory} if working_directory else {})),
                     )
 
 
@@ -784,7 +818,7 @@ def _collect_docker(context: RepoContext, evidence: list[Evidence]) -> None:
 def _collect_locks(context: RepoContext, evidence: list[Evidence]) -> None:
     names = (
         "uv.lock", "poetry.lock", "Pipfile.lock", "pdm.lock", "package-lock.json",
-        "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml",
+        "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock", "bun.lockb",
     )
     for name in dict.fromkeys((*names, *_lock_paths(context, "python"), *_lock_paths(context, "node"))):
         entry = context.entry(name)
@@ -800,7 +834,7 @@ def _collect_locks(context: RepoContext, evidence: list[Evidence]) -> None:
                 attributes=_attrs(source="filesystem", role="lockfile"),
             )
     for entry in context:
-        if re.fullmatch(r"requirements(?:-[^/]+)?\.lock", entry.path) and entry.readable:
+        if re.fullmatch(r"(?:[^/]+/)*requirements(?:-[^/]+)?\.lock", entry.path) and entry.readable:
             _add_evidence(
                 evidence,
                 kind="lockfile",
@@ -1200,9 +1234,12 @@ def _link_dependencies(
                 references.add(token.split("=", 1)[1])
             elif token.startswith("-r") and len(token) > 2:
                 references.add(token[2:])
-            elif token in {"package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "uv.lock", "poetry.lock", "Pipfile.lock", "pdm.lock"}:
+            elif token in {"package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock", "bun.lockb", "uv.lock", "poetry.lock", "Pipfile.lock", "pdm.lock"}:
                 references.add(token)
         for path in sorted(references):
+            working_directory = dict(command.attributes).get("working-directory")
+            if working_directory and not path.startswith(("/", "../")):
+                path = posixpath.normpath(posixpath.join(working_directory, path))
             path = posixpath.normpath(path)
             target = next((item for item in locks if item.file == path), None)
             uncertain = path.startswith(("/", "../")) or path == ".." or any(char in path for char in "$*?{}:")
@@ -1273,6 +1310,77 @@ def _link_copies(context: RepoContext, evidence: list[Evidence], edges: list[Con
             )
 
 
+def _workflow_structure(context: RepoContext, evidence: list[Evidence], diagnostics: list[ContractDiagnostic]) -> None:
+    """Detect duplicate top-level YAML keys without requiring a YAML package."""
+
+    for entry in context:
+        if not entry.path.startswith(".github/workflows/") or not entry.readable:
+            continue
+        text = context.read_text(entry)
+        if text is None:
+            continue
+        keys: dict[str, int] = {}
+        top_level: set[str] = set()
+        for line_number, line in enumerate(text.splitlines(), 1):
+            if not line.strip() or line.lstrip().startswith("#") or line.startswith((" ", "\t")):
+                continue
+            match = re.match(r"^([A-Za-z_][A-Za-z0-9_-]*):(?:\s|$)", line)
+            if not match:
+                continue
+            key = match.group(1)
+            top_level.add(key)
+            if key in keys:
+                first = _add_evidence(
+                    evidence,
+                    kind="workflow",
+                    subject=f"duplicate-{key}",
+                    file=entry.path,
+                    line=keys[key],
+                    value=key,
+                    normalized=key,
+                    attributes=_attrs(source="workflow", role="duplicate-key"),
+                )
+                second = _add_evidence(
+                    evidence,
+                    kind="workflow",
+                    subject=f"duplicate-{key}",
+                    file=entry.path,
+                    line=line_number,
+                    value=key,
+                    normalized=key,
+                    attributes=_attrs(source="workflow", role="duplicate-key"),
+                )
+                _diagnostic(
+                    diagnostics,
+                    code="CG015",
+                    severity="error",
+                    message=f"Workflow {entry.path!r} repeats the top-level YAML key {key!r}.",
+                    evidence=(first, second),
+                    related_checks=("RR13",),
+                )
+            else:
+                keys[key] = line_number
+        if "jobs" not in top_level and {"name", "on"} & top_level:
+            item = _add_evidence(
+                evidence,
+                kind="workflow",
+                subject="workflow-structure",
+                file=entry.path,
+                line=1,
+                value="missing jobs",
+                normalized="missing-jobs",
+                attributes=_attrs(source="workflow", role="structure"),
+            )
+            _diagnostic(
+                diagnostics,
+                code="CG016",
+                severity="error",
+                message=f"Workflow {entry.path!r} has no top-level jobs mapping.",
+                evidence=(item,),
+                related_checks=("RR13",),
+            )
+
+
 def build_contract_graph(
     context: RepoContext,
     ecosystems: Iterable[str] | None = None,
@@ -1295,6 +1403,7 @@ def build_contract_graph(
     _link_runtimes(evidence, edges, diagnostics)
     _link_dependencies(context, evidence, edges, diagnostics)
     _link_copies(context, evidence, edges, diagnostics)
+    _workflow_structure(context, evidence, diagnostics)
 
     return ContractGraph(
         version=GRAPH_VERSION,

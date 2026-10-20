@@ -9,8 +9,10 @@ from __future__ import annotations
 import json
 import ast
 import configparser
+import fnmatch
 import re
 import tomllib
+import unicodedata
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Callable, Iterable
@@ -105,6 +107,8 @@ CHECK_FIXABLE: dict[str, bool] = {
     "RR13": True,
 }
 
+_UNSET = object()
+
 
 def _finding(file: str, detail: str, line: int | None = None) -> Finding:
     return Finding(file=file, line=line, detail=detail)
@@ -116,7 +120,7 @@ def _result(
     findings: Iterable[Finding] = (),
     *,
     message: str | None = None,
-    fix_hint: str | None = None,
+    fix_hint: str | None | object = _UNSET,
     fixable: bool | None = None,
     na: bool = False,
 ) -> CheckResult:
@@ -124,6 +128,9 @@ def _result(
     earned = max(0, min(weight, int(earned)))
     findings_tuple = tuple(sorted(findings, key=lambda item: (item.file, item.line or 0, item.detail)))
     status = "na" if na else ("pass" if earned == weight else "partial" if earned else "fail")
+    selected_hint = CHECK_HINTS[rule_id] if fix_hint is _UNSET else fix_hint
+    if status in {"pass", "na"}:
+        selected_hint = None
     return CheckResult(
         id=rule_id,
         title=CHECK_TITLES[rule_id],
@@ -131,7 +138,7 @@ def _result(
         earned=earned,
         status=status,
         message=message or CHECK_MESSAGES[rule_id],
-        fix_hint=CHECK_HINTS[rule_id] if fix_hint is None else fix_hint,
+        fix_hint=selected_hint,  # type: ignore[arg-type]
         fixable=CHECK_FIXABLE[rule_id] if fixable is None else fixable,
         findings=findings_tuple,
     )
@@ -160,12 +167,43 @@ def _headings(text: str) -> dict[str, int]:
     for number, line in enumerate(lines, 1):
         markdown = re.match(r"^\s*#{1,6}\s+(.+?)\s*#*\s*$", line)
         if markdown:
-            result[re.sub(r"\s+", " ", markdown.group(1)).strip().casefold()] = number
+            result[_heading_key(markdown.group(1))] = number
         if number < len(lines):
             next_line = lines[number].strip()
             if line.strip() and re.fullmatch(r"(?:=+|-+)", next_line):
-                result[line.strip().casefold()] = number
+                result[_heading_key(line)] = number
     return result
+
+
+def _heading_key(value: str) -> str:
+    """Normalize a Markdown heading for semantic, not exact, matching."""
+
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    normalized = "".join(char if char.isalnum() else " " for char in normalized)
+    return " ".join(normalized.split())
+
+
+def _readme_sections(text: str) -> tuple[tuple[str, str], ...]:
+    lines = text.splitlines()
+    starts: list[tuple[int, str]] = []
+    for number, line in enumerate(lines):
+        match = re.match(r"^\s*#{1,6}\s+(.+?)\s*#*\s*$", line)
+        if match:
+            starts.append((number, _heading_key(match.group(1))))
+        elif number + 1 < len(lines) and line.strip() and re.fullmatch(r"\s*(?:=+|-+)\s*", lines[number + 1]):
+            starts.append((number, _heading_key(line)))
+    sections: list[tuple[str, str]] = []
+    for index, (start, title) in enumerate(starts):
+        end = starts[index + 1][0] if index + 1 < len(starts) else len(lines)
+        sections.append((title, "\n".join(lines[start:end])))
+    return tuple(sections)
+
+
+def _readme_has_command(text: str, pattern: str) -> bool:
+    return bool(re.search(
+        rf"(?im)(?:^|[`$> ])(?:python(?:\d+(?:\.\d+)?)?|pip|npm|yarn|pnpm|go|cargo|dotnet|mvnw?|gradlew?|bundle|make|docker|uv|poetry)\s+(?:[^\n`]*\b)?{pattern}",
+        text,
+    ))
 
 
 def rr01(ctx: RepoContext) -> CheckResult:
@@ -173,18 +211,39 @@ def rr01(ctx: RepoContext) -> CheckResult:
     if readme is None:
         return _result("RR01", 0, [_finding("README.md", "README file is missing.")])
     path, text = readme
-    headings = _headings(text)
+    sections = _readme_sections(text)
+    section_names = {title for title, _ in sections}
     earned = 4
     findings: list[Finding] = []
-    if "setup" in headings or "install" in headings or "installation" in headings:
+    setup_heading = any(
+        "getting started" in title
+        or "installation" in title
+        or "development" in title
+        or "setup" in title
+        or "install" in title
+        for title in section_names
+    )
+    run_heading = any(
+        "usage" in title
+        or "getting started" in title
+        or "development" in title
+        or "run" in title
+        or "launch" in title
+        for title in section_names
+    )
+    test_heading = any(
+        "test" in title or "quality" in title
+        for title in section_names
+    )
+    if setup_heading or _readme_has_command(text, r"(?:install|sync|setup|create)\b"):
         earned += 4
     else:
         findings.append(_finding(path, "README is missing a setup or install heading."))
-    if "run" in headings or "usage" in headings:
+    if run_heading or _readme_has_command(text, r"(?:run|dev|start|serve|build)\b"):
         earned += 3
     else:
         findings.append(_finding(path, "README is missing a run or usage heading."))
-    if "test" in headings or "testing" in headings:
+    if test_heading or _readme_has_command(text, r"(?:test|pytest|check|lint)\b"):
         earned += 3
     else:
         findings.append(_finding(path, "README is missing a test heading."))
@@ -212,7 +271,7 @@ def rr04(ctx: RepoContext) -> CheckResult:
 
 
 _PYTHON_METADATA_FILES = ("pyproject.toml", "setup.cfg", "setup.py", "Pipfile")
-_REQUIREMENTS_FILE = re.compile(r"requirements(?:-[^/]+)?\.txt")
+_REQUIREMENTS_FILE = re.compile(r"(?:[^/]+/)*requirements(?:-[^/]+)?\.txt")
 _DEPENDENCY_GROUPS = (
     "dependencies",
     "devDependencies",
@@ -471,6 +530,14 @@ def _python_marker_present(ctx: RepoContext) -> bool:
     return bool(_python_metadata_paths(ctx) or any(_REQUIREMENTS_FILE.fullmatch(entry.path) for entry in ctx))
 
 
+def _component_prefix(path: str) -> str:
+    return path.rsplit("/", 1)[0] if "/" in path else ""
+
+
+def _component_path(prefix: str, name: str) -> str:
+    return f"{prefix}/{name}" if prefix else name
+
+
 def _python_manifest(ctx: RepoContext) -> bool:
     paths = _python_metadata_paths(ctx)
     return bool(paths) and not any(_manifest_findings(ctx, path) for path in paths)
@@ -662,32 +729,52 @@ def _valid_requirements_lock(text: str | None) -> bool:
 def _lock_paths(ctx: RepoContext, ecosystem: str) -> tuple[str, ...]:
     if ecosystem == "python":
         requirements = sorted(entry.path for entry in ctx if _REQUIREMENTS_FILE.fullmatch(entry.path))
-        for name in ("uv.lock", "poetry.lock", "Pipfile.lock", "pdm.lock"):
-            if ctx.has_file(name):
-                return (name,)
+        structured_names = ("uv.lock", "poetry.lock", "Pipfile.lock", "pdm.lock")
+        structured: list[str] = []
+        prefixes = sorted({_component_prefix(entry.path) for entry in ctx if entry.name in set(structured_names)})
+        for prefix in prefixes:
+            selected = next(
+                (_component_path(prefix, name) for name in structured_names if ctx.has_file(_component_path(prefix, name))),
+                None,
+            )
+            if selected:
+                structured.append(selected)
+        if structured:
+            return tuple(structured)
         return tuple(requirements)
     if ecosystem == "node":
-        for name in ("package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml"):
-            if ctx.has_file(name):
-                return (name,)
-        return ()
+        lock_names = ("package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock", "bun.lockb")
+        paths: list[str] = []
+        prefixes = sorted({_component_prefix(entry.path) for entry in ctx if entry.name in set(lock_names)})
+        for prefix in prefixes:
+            selected = next(
+                (_component_path(prefix, name) for name in lock_names if ctx.has_file(_component_path(prefix, name))),
+                None,
+            )
+            if selected:
+                paths.append(selected)
+        return tuple(paths)
     profile = profile_for(ecosystem)
     if profile is None:
         return ()
     return tuple(
         entry.path
         for entry in ctx
-        if any(entry.path == pattern or re.fullmatch(pattern.replace("*", ".*"), entry.path) for pattern in profile.lock_files)
+        if any(entry.name == pattern or fnmatch.fnmatchcase(entry.name, pattern) for pattern in profile.lock_files)
     )
 
 
-def _python_declared_names(ctx: RepoContext) -> set[str]:
+def _python_declared_names(ctx: RepoContext, prefix: str = "") -> set[str]:
     names: set[str] = set()
-    for path in sorted(entry.path for entry in ctx if _REQUIREMENTS_FILE.fullmatch(entry.path)):
+    for path in sorted(
+        entry.path for entry in ctx
+        if _REQUIREMENTS_FILE.fullmatch(entry.path) and _component_prefix(entry.path) == prefix
+    ):
         for line in _requirement_entries(ctx.read_text(path)):
             if name := _dependency_name(line):
                 names.add(name)
-    value = _toml(ctx, "pyproject.toml") if ctx.has_file("pyproject.toml") else None
+    pyproject_path = _component_path(prefix, "pyproject.toml")
+    value = _toml(ctx, pyproject_path) if ctx.has_file(pyproject_path) else None
     project = value.get("project") if value else None
     if isinstance(project, dict):
         values = list(project.get("dependencies", [])) if isinstance(project.get("dependencies"), list) else []
@@ -702,17 +789,20 @@ def _python_declared_names(ctx: RepoContext) -> set[str]:
             values = poetry.get(section)
             if isinstance(values, dict):
                 names.update(str(name).casefold() for name in values if str(name).casefold() != "python")
-    parser = _setup_cfg_parser(ctx.read_text("setup.cfg")) if ctx.has_file("setup.cfg") else None
+    setup_cfg_path = _component_path(prefix, "setup.cfg")
+    parser = _setup_cfg_parser(ctx.read_text(setup_cfg_path)) if ctx.has_file(setup_cfg_path) else None
     if parser is not None:
         if parser.has_section("options"):
             names.update(name for line in _requirement_entries(parser.get("options", "install_requires", fallback="")) if (name := _dependency_name(line)))
         if parser.has_section("options.extras_require"):
             for _, value in parser.items("options.extras_require"):
                 names.update(name for line in _requirement_entries(value) if (name := _dependency_name(line)))
-    known, setup_names = _setup_dependency_names(ctx.read_text("setup.py")) if ctx.has_file("setup.py") else (True, set())
+    setup_path = _component_path(prefix, "setup.py")
+    known, setup_names = _setup_dependency_names(ctx.read_text(setup_path)) if ctx.has_file(setup_path) else (True, set())
     if known:
         names.update(setup_names)
-    pipfile = _toml(ctx, "Pipfile") if ctx.has_file("Pipfile") else None
+    pipfile_path = _component_path(prefix, "Pipfile")
+    pipfile = _toml(ctx, pipfile_path) if ctx.has_file(pipfile_path) else None
     if isinstance(pipfile, dict):
         for section in ("packages", "dev-packages"):
             packages = pipfile.get(section)
@@ -721,8 +811,9 @@ def _python_declared_names(ctx: RepoContext) -> set[str]:
     return names
 
 
-def _node_declared_names(ctx: RepoContext) -> set[str]:
-    package = _json(ctx, "package.json") if ctx.has_file("package.json") else None
+def _node_declared_names(ctx: RepoContext, prefix: str = "") -> set[str]:
+    package_path = _component_path(prefix, "package.json")
+    package = _json(ctx, package_path) if ctx.has_file(package_path) else None
     if not isinstance(package, dict):
         return set()
     names: set[str] = set()
@@ -772,14 +863,15 @@ def _valid_toml_lock(
     value = _toml(ctx, path)
     if value is None:
         return False, f"{path} must contain valid TOML."
-    if path == "uv.lock":
+    lock_name = PurePosixPath(path).name
+    if lock_name == "uv.lock":
         if isinstance(value.get("version"), bool) or not isinstance(value.get("version"), int):
             return False, "uv.lock needs an integer version field."
-    elif path == "poetry.lock":
+    elif lock_name == "poetry.lock":
         metadata = value.get("metadata")
         if not isinstance(metadata, dict) or not _nonempty_string(metadata.get("lock-version")):
             return False, "poetry.lock needs a [metadata] table with lock-version."
-    elif path == "pdm.lock":
+    elif lock_name == "pdm.lock":
         metadata = value.get("metadata")
         lock_version = value.get("lock_version")
         if lock_version is None and isinstance(metadata, dict):
@@ -1020,7 +1112,8 @@ def _validate_lock(ctx: RepoContext, path: str, ecosystem: str, declared: set[st
             }
             missing = sorted(declared - names)
             return (not missing, f"{path} does not cover declared dependencies: {', '.join(missing)}." if missing else "")
-        if path == "Pipfile.lock":
+        lock_name = PurePosixPath(path).name
+        if lock_name == "Pipfile.lock":
             if not _valid_pipfile_lock(ctx, path):
                 return False, "Pipfile.lock must be valid JSON with non-empty _meta, default, or develop records."
             lock = _json(ctx, path) or {}
@@ -1033,15 +1126,20 @@ def _validate_lock(ctx: RepoContext, path: str, ecosystem: str, declared: set[st
             missing = sorted(name for name in declared if name not in covered)
             return (not missing, f"Pipfile.lock does not cover declared dependencies: {', '.join(missing)}." if missing else "")
         return _valid_toml_lock(ctx, path, declared)
-    if path in {"package-lock.json", "npm-shrinkwrap.json"}:
+    if PurePosixPath(path).name in {"package-lock.json", "npm-shrinkwrap.json"}:
         lock = _json(ctx, path)
         if not _valid_node_lock(lock):
             return False, f"{path} must be valid JSON with lockfileVersion 1, 2, or 3 and dependency records."
         assert lock is not None
         missing = sorted(declared - _node_lock_covers(lock, declared))
         return (not missing, f"{path} does not cover declared dependencies: {', '.join(missing)}." if missing else "")
-    if path == "yarn.lock":
+    if PurePosixPath(path).name == "yarn.lock":
         return _valid_yarn_lock(ctx.read_text(path), declared)
+    if PurePosixPath(path).name in {"bun.lock", "bun.lockb"}:
+        text = ctx.read_text(path)
+        if text is None or not text.strip():
+            return False, f"{path} is empty or unreadable."
+        return True, ""
     if ecosystem in {"go", "rust", "dotnet", "java", "ruby"}:
         return _valid_generic_lock(ctx, path, ecosystem, declared)
     return _valid_pnpm_lock(ctx.read_text(path), declared)
@@ -1051,16 +1149,19 @@ def _lock_status(ctx: RepoContext, ecosystem: str) -> tuple[bool | None, list[Fi
     if not _dependencies(ctx, ecosystem):
         return None, []
     paths = _lock_paths(ctx, ecosystem)
-    if ecosystem == "python":
-        declared = _python_declared_names(ctx)
-    elif ecosystem == "node":
-        declared = _node_declared_names(ctx)
-    else:
-        declared = _generic_declared_names(ctx, ecosystem)
     if not paths:
         return False, [_finding(".", f"{ecosystem.title()} dependencies are declared but no supported lockfile was found.")]
     findings: list[Finding] = []
     for path in paths:
+        prefix = _component_prefix(path)
+        if ecosystem == "python":
+            declared = _python_declared_names(ctx, prefix)
+        elif ecosystem == "node":
+            declared = _node_declared_names(ctx, prefix)
+        else:
+            declared = _generic_declared_names(ctx, ecosystem)
+        if not declared:
+            declared = _python_declared_names(ctx) if ecosystem == "python" else _node_declared_names(ctx) if ecosystem == "node" else declared
         valid, detail = _validate_lock(ctx, path, ecosystem, declared)
         if not valid:
             findings.append(_finding(path, detail or "Lockfile is malformed or empty."))
@@ -1218,7 +1319,28 @@ def _docker_command_is_present(body: str) -> bool:
     return True
 
 
-def rr08(ctx: RepoContext) -> CheckResult:
+def _container_applicable(ctx: RepoContext, profile: str) -> bool:
+    if profile in {"legacy", "containerized-service"}:
+        return True
+    if ctx.has_file("Dockerfile") or ctx.has_file("Containerfile"):
+        return True
+    if profile in {"library", "web-app", "monorepo"}:
+        return False
+    # Auto mode treats missing deployment evidence as unknown rather than
+    # making Docker a universal requirement.
+    return False
+
+
+def rr08(ctx: RepoContext, profile: str = "legacy") -> CheckResult:
+    if not _container_applicable(ctx, profile):
+        return _result(
+            "RR08",
+            CHECK_WEIGHTS["RR08"],
+            message="Container deployment is not indicated by the selected project profile.",
+            fix_hint=None,
+            fixable=False,
+            na=True,
+        )
     path, text = _root_dockerfile(ctx)
     if path is None:
         return _result("RR08", 0, [_finding("Dockerfile", "Root Dockerfile or Containerfile is missing.")])
@@ -1370,6 +1492,12 @@ def rr09(ctx: RepoContext, ecosystems: tuple[str, ...]) -> CheckResult:
 _ENV_FILES = (".env.example", ".env.sample", ".env.template")
 _SOURCE_SUFFIXES = {".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".go", ".rs", ".cs", ".fs", ".vb", ".java", ".kt", ".kts", ".rb", ".rake"}
 _ENV_NAME = r"[A-Z_][A-Z0-9_]*"
+_EXTERNAL_ENV_NAMES = {
+    "CI", "GITHUB_ACTIONS", "GITHUB_SHA", "GITHUB_REF", "GITHUB_REF_NAME",
+    "GITHUB_REPOSITORY", "GITHUB_RUN_ID", "GITHUB_TOKEN", "RUNNER_OS",
+    "RUNNER_ARCH", "RUNNER_TEMP", "PORT", "VERCEL", "VERCEL_URL",
+    "VERCEL_ENV", "RENDER", "RENDER_SERVICE_ID", "NODE_ENV",
+}
 _PY_ENV = re.compile(r"\bos\.(?:environ(?:\.get)?|getenv)\s*(?:\[\s*[\"'](" + _ENV_NAME + r")[\"']|\(\s*[\"'](" + _ENV_NAME + r")[\"'])")
 _NODE_ENV = re.compile(r"\bprocess\.env(?:\.((?:" + _ENV_NAME + r"))|\[\s*[\"'](" + _ENV_NAME + r")[\"'])")
 _GO_ENV = re.compile(r"\bos\.Getenv\s*\(\s*[\"'](" + _ENV_NAME + r")[\"']\s*\)")
@@ -1382,12 +1510,16 @@ _RUBY_ENV = re.compile(r"\bENV(?:\[|\.fetch\s*\(\s*)[\"'](" + _ENV_NAME + r")[\"
 def environment_reads(ctx: RepoContext) -> tuple[tuple[str, int, str], ...]:
     reads: list[tuple[str, int, str]] = []
     for entry in ctx:
+        if entry.path.startswith(("tests/", "test/", "docs/", "examples/")):
+            continue
         if PurePosixPath(entry.path).suffix.casefold() not in _SOURCE_SUFFIXES:
             continue
         text = ctx.read_indexed_text(entry)
         if text is None:
             continue
         for line_number, line in enumerate(text.splitlines(), 1):
+            if line.lstrip().startswith(("#", "//", "/*", "*")):
+                continue
             for pattern in (_PY_ENV, _NODE_ENV, _GO_ENV, _RUST_ENV, _DOTNET_ENV, _JAVA_ENV, _RUBY_ENV):
                 match = pattern.search(line)
                 if match:
@@ -1400,36 +1532,48 @@ def environment_reads(ctx: RepoContext) -> tuple[tuple[str, int, str], ...]:
 
 def _env_keys(ctx: RepoContext) -> set[str]:
     keys: set[str] = set()
-    for name in _ENV_FILES:
-        text = ctx.read_text(name)
+    for entry in ctx:
+        if entry.name not in _ENV_FILES:
+            continue
+        text = ctx.read_text(entry)
         if text is None:
             continue
         for line in text.splitlines():
-            match = re.match(r"^\s*(" + _ENV_NAME + r")\s*=", line)
+            match = re.match(r"^\s*(?:#\s*)?(?:export\s+)?(" + _ENV_NAME + r")\s*(?:=|$)", line)
             if match:
                 keys.add(match.group(1))
     return keys
+
+
+def _env_example_paths(ctx: RepoContext) -> tuple[str, ...]:
+    return tuple(entry.path for entry in ctx if entry.name in _ENV_FILES and entry.readable)
 
 
 def rr10(ctx: RepoContext) -> CheckResult:
     reads = environment_reads(ctx)
     if not reads:
         return _result("RR10", 6, na=True)
-    present = _nonempty(ctx, _ENV_FILES)
+    external_names = _EXTERNAL_ENV_NAMES | set(getattr(ctx, "external_env", ()))
+    if all(name in external_names for _, _, name in reads):
+        return _result("RR10", 6, na=True, message="All environment variables are supplied by the deployment environment.")
+    present = bool(_env_example_paths(ctx))
     keys = _env_keys(ctx)
-    earned = (3 if present else 0) + (3 if {name for _, _, name in reads}.issubset(keys) else 0)
+    required = {name for _, _, name in reads if name not in external_names}
+    earned = (3 if present else 0) + (3 if required.issubset(keys) else 0)
     findings: list[Finding] = []
     if not present:
         findings.append(_finding(".env.example", "No example environment file is present."))
+    seen: set[str] = set()
     for path, line, name in reads:
-        if name not in keys:
+        if name not in keys and name not in external_names and name not in seen:
+            seen.add(name)
             findings.append(_finding(path, f"Environment key {name} is not listed in an example env file.", line))
     return _result("RR10", earned, findings)
 
 
 _LOCKFILE_NAMES = {
     "uv.lock", "poetry.lock", "Pipfile.lock", "pdm.lock", "package-lock.json",
-    "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml",
+    "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock", "bun.lockb",
 }
 _ABSOLUTE_PATHS = (
     re.compile(r"(?<![A-Za-z0-9_])/(?:Users|home)/[^/\s]+/"),
@@ -1441,7 +1585,7 @@ _ABSOLUTE_PATHS = (
 def rr11(ctx: RepoContext) -> CheckResult:
     findings: list[Finding] = []
     for entry in ctx:
-        if entry.name in _LOCKFILE_NAMES or entry.path in _ENV_FILES:
+        if entry.name in _LOCKFILE_NAMES or entry.name in _ENV_FILES:
             continue
         text = ctx.read_indexed_text(entry)
         if text is None:
@@ -1487,7 +1631,30 @@ def rr12(ctx: RepoContext, ecosystems: tuple[str, ...]) -> CheckResult:
 
 def rr13(ctx: RepoContext) -> CheckResult:
     workflow = next((entry.path for entry in ctx if entry.path.startswith(".github/workflows/") and entry.readable and entry.size > 0), None)
-    return _result("RR13", 6 if workflow else 0, () if workflow else [_finding(".github/workflows", "No CI workflow is present.")])
+    if workflow is None:
+        return _result("RR13", 0, [_finding(".github/workflows", "No CI workflow is present.")])
+    text = ctx.read_text(workflow)
+    if text is None:
+        return _result("RR13", 0, [_finding(workflow, "CI workflow is unreadable.")])
+    keys: dict[str, int] = {}
+    findings: list[Finding] = []
+    top_level: set[str] = set()
+    for line_number, line in enumerate(text.splitlines(), 1):
+        if not line.strip() or line.lstrip().startswith("#") or line.startswith((" ", "\t")):
+            continue
+        match = re.match(r"^([A-Za-z_][A-Za-z0-9_-]*):(?:\s|$)", line)
+        if not match:
+            continue
+        key = match.group(1)
+        top_level.add(key)
+        if key in keys:
+            findings.append(_finding(workflow, f"Top-level workflow key {key!r} is duplicated.", line_number))
+        else:
+            keys[key] = line_number
+    if "jobs" not in top_level and {"name", "on"} & top_level:
+        findings.append(_finding(workflow, "Workflow has no top-level jobs mapping."))
+    earned = 6 if not findings else 3 if "jobs" in top_level else 0
+    return _result("RR13", earned, findings)
 
 
 @dataclass(frozen=True)
@@ -1503,12 +1670,14 @@ RULES: tuple[Rule, ...] = (
 )
 
 
-def run_checks(ctx: RepoContext, ecosystems: Iterable[str]) -> tuple[CheckResult, ...]:
+def run_checks(ctx: RepoContext, ecosystems: Iterable[str], *, profile: str = "legacy") -> tuple[CheckResult, ...]:
     values = tuple(ecosystems)
     results: list[CheckResult] = []
     for rule in RULES:
         if rule.id in {"RR06", "RR07", "RR09", "RR12"}:
             results.append(rule.run(ctx, values))
+        elif rule.id == "RR08":
+            results.append(rule.run(ctx, profile))
         else:
             results.append(rule.run(ctx))
     return tuple(results)

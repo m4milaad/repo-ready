@@ -16,9 +16,11 @@ from .contracts import diagnose
 from .context import ConfigError, RepoContext
 from .fixer import PlannedFile, apply_fix_plan, plan_fixes, project_fix_score, protect_score
 from .formats import render_markdown, render_sarif
+from .inventory import scan_inventory
+from .integrity import inspect_integrity
 from .tracked import inspect_tracked
 from .registry import rule_descriptors
-from .scoring import report
+from .scoring import report, resolve_profile
 from .showcase import build_showcase
 from .showcase_html import render_showcase
 
@@ -41,9 +43,19 @@ def _parser() -> argparse.ArgumentParser:
     check.add_argument("path", nargs="?", type=Path, default=None)
     check.add_argument("--json", action="store_true", dest="as_json")
     check.add_argument("--format", choices=("text", "json", "markdown", "sarif"), default=None)
-    check.add_argument("--scope", choices=("filesystem", "tracked"), default="filesystem")
+    check.add_argument(
+        "--scope", choices=("auto", "filesystem", "tracked"), default="auto",
+        help="scan tracked Git files when available (default: auto)",
+    )
+    check.add_argument(
+        "--profile",
+        choices=("auto", "legacy", "library", "web-app", "containerized-service", "monorepo"),
+        default="auto",
+        help="scoring context; auto avoids irrelevant deployment checks",
+    )
     check.add_argument("--min-score", type=int, default=None)
     check.add_argument("--no-color", action="store_true")
+    check.add_argument("--no-progress", action="store_true", help="disable scan progress on stderr")
 
     diagnose_command = commands.add_parser("diagnose", help="inspect cross-file repository contracts")
     diagnose_command.add_argument("path", nargs="?", type=Path, default=None)
@@ -84,7 +96,12 @@ def _parser() -> argparse.ArgumentParser:
         "--output", "-o", type=Path, default=Path("repo-report.html"),
         help="HTML report destination (default: ./repo-report.html)",
     )
-    showcase.add_argument("--scope", choices=("filesystem", "tracked"), default="filesystem")
+    showcase.add_argument("--scope", choices=("auto", "filesystem", "tracked"), default="auto")
+    showcase.add_argument(
+        "--profile",
+        choices=("auto", "legacy", "library", "web-app", "containerized-service", "monorepo"),
+        default="auto",
+    )
     showcase.add_argument("--no-scenarios", action="store_true")
     showcase.add_argument("--json", action="store_true", dest="as_json",
                           help="print the computed payload instead of writing HTML")
@@ -144,14 +161,39 @@ def _print_human_report(result: dict[str, object], *, no_color: bool = False) ->
 
 
 def _run_check(args: argparse.Namespace, repository: Path) -> int:
+    started = os.times().elapsed
     include_paths = None
-    if args.scope == "tracked":
+    tracked = None
+    effective_scope = args.scope
+    if args.scope in {"auto", "tracked"}:
         tracked = inspect_tracked(repository)
-        if tracked.index_version is None:
+        if args.scope == "tracked" and tracked.index_version is None:
             raise ConfigError("tracked scope requires a readable Git index")
-        include_paths = (item.path for item in tracked.files)
-    context = RepoContext(repository, include_paths=include_paths)
-    result = report(args.path, context=context)
+        if tracked.index_version is not None:
+            include_paths = (item.path for item in tracked.files)
+            effective_scope = "tracked"
+        else:
+            effective_scope = "filesystem"
+            tracked = None
+    show_progress = not args.no_progress and not args.as_json and getattr(sys.stderr, "isatty", lambda: False)()
+
+    def progress(files: int, byte_count: int) -> None:
+        if show_progress:
+            print(f"  Indexed {files} files ({byte_count:,} bytes)...", file=sys.stderr)
+
+    if show_progress:
+        print(f"Scanning {repository}", file=sys.stderr)
+        print(f"Scope: {effective_scope}", file=sys.stderr)
+    context = RepoContext(repository, include_paths=include_paths, progress=progress if show_progress else None)
+    result = report(args.path, context=context, profile=args.profile)
+    result["profile"] = resolve_profile(context, args.profile)
+    result["scan"] = scan_inventory(
+        context,
+        requested_scope=args.scope,
+        effective_scope=effective_scope,
+        tracked=tracked,
+    )
+    result["integrity"] = inspect_integrity(context, tracked)
     output_format = "json" if args.as_json else (args.format or "text")
     if output_format == "json":
         print(json.dumps(result, indent=2))
@@ -161,6 +203,15 @@ def _run_check(args: argparse.Namespace, repository: Path) -> int:
         print(render_sarif(result))
     else:
         _print_human_report(result, no_color=args.no_color)
+    if show_progress:
+        elapsed = os.times().elapsed - started
+        inventory = result["scan"]
+        assert isinstance(inventory, dict)
+        print(
+            f"Completed in {elapsed:.2f}s — {inventory['files']} files, "
+            f"{inventory['bytes']:,} bytes indexed.",
+            file=sys.stderr,
+        )
     threshold = args.min_score if args.min_score is not None else context.min_score
     if threshold is not None and int(result["score"]) < threshold:
         return 1
@@ -298,7 +349,7 @@ def _run_fix(args: argparse.Namespace, repository: Path) -> int:
 
 
 def _run_showcase(args: argparse.Namespace, repository: Path) -> int:
-    payload = build_showcase(repository, scope=args.scope, scenarios=not args.no_scenarios)
+    payload = build_showcase(repository, scope=args.scope, scenarios=not args.no_scenarios, profile=args.profile)
     if args.as_json:
         print(json.dumps(payload, indent=2, ensure_ascii=True, sort_keys=True))
         return 0

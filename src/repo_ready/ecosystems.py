@@ -48,7 +48,7 @@ ECOSYSTEM_PROFILES: tuple[EcosystemProfile, ...] = (
     EcosystemProfile(
         "node",
         ("package.json",),
-        ("package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml"),
+        ("package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock", "bun.lockb"),
         (".nvmrc", ".node-version", ".tool-versions"),
         "npm test",
         (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"),

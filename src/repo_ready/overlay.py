@@ -104,6 +104,7 @@ class _FrozenContext(RepoContext):
         self.max_total_bytes = base.max_total_bytes
         self.include_paths = base.include_paths
         self.min_score = base.min_score
+        self.external_env = getattr(base, "external_env", ())
         self.config_excludes = base.config_excludes
         self.excludes = base.excludes
         self._exclude_patterns = base._exclude_patterns
@@ -112,6 +113,8 @@ class _FrozenContext(RepoContext):
         self._glob_excludes = base._glob_excludes
         self._truncated = base.truncated
         self._truncation_reasons = frozenset(base.truncation_reasons)
+        self._excluded_files = getattr(base, "excluded_files", 0)
+        self._progress = None
 
     def _freeze(
         self,

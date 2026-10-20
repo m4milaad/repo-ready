@@ -121,15 +121,21 @@ def _static_baseline(payload: dict) -> str:
             f'{finding.get("file", "")}:{finding.get("line") or "—"} — {finding.get("detail", "")}'
             for finding in check.get("findings", [])
         ], "No file-level findings for this check."))
-        if check.get("fix_hint"):
+        if check.get("status") not in {"pass", "na"} and check.get("fix_hint"):
             parts.append(f'<p>{_escape(check["fix_hint"])}</p>')
         parts.append("</article>")
     parts.append('</section><section class="report-section"><h2>Contract diagnostics</h2>')
+    diagnostics = sorted(
+        graph.get("diagnostics", []),
+        key=lambda item: ({"error": 0, "warning": 1, "info": 2}.get(item.get("severity"), 3), item.get("code", "")),
+    )
     parts.append(_list([
         f'{item.get("code", "")} · {item.get("severity", "")} — {item.get("message", "")} '
         f'| Evidence: {", ".join(item.get("evidence", [])) or "none"}'
-        for item in graph.get("diagnostics", [])
+        for item in diagnostics[:5]
     ], "No contract diagnostics were included. This is not proof of runtime correctness."))
+    if len(diagnostics) > 5:
+        parts.append(f'<p class="caption">Showing the five highest-priority diagnostics; {len(diagnostics) - 5} additional diagnostics remain in the downloadable JSON evidence.</p>')
     parts.append('</section><section class="report-section"><h2>Evidence ledger</h2>')
     evidence = graph.get("evidence", [])
     if evidence:
@@ -150,12 +156,17 @@ def _static_baseline(payload: dict) -> str:
         parts.append('<p class="empty">No file evidence was included; there is no schematic to trace.</p>')
     parts.append('<h3>Evidence map / accessible relationship list</h3>')
     parts.append('<p class="caption">JavaScript adds the visual map. This deterministic relationship list is the static, accessible equivalent and remains available when the controller is disabled.</p>')
+    edges = graph.get("edges", [])
+    actionable_edges = [item for item in edges if item.get("status") != "satisfied"]
+    satisfied_count = len(edges) - len(actionable_edges)
     parts.append(_list([
         f'{edge.get("source", "")} → {edge.get("target") or "unresolved target"} · '
         f'{edge.get("relation", "")} · {edge.get("status", "")} — {edge.get("detail", "")} '
         f'| Expected: {edge.get("expected")} | Actual: {edge.get("actual")}'
-        for edge in graph.get("edges", [])
+        for edge in actionable_edges[:25]
     ], "No relationships were included."))
+    if satisfied_count:
+        parts.append(f'<p class="caption">{satisfied_count} satisfied relationships are collapsed from this view; the downloadable JSON retains the complete graph.</p>')
     parts.append('</section><section class="report-section"><h2>Repair notes</h2>')
     if repair:
         projected_delta = repair.get("score_delta")

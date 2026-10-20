@@ -21,12 +21,36 @@ def grade(score: int) -> str:
     return "Not ready"
 
 
-def scan(root: str | Path, *, context: RepoContext | None = None) -> ScanReport:
+def resolve_profile(context: RepoContext, profile: str) -> str:
+    """Resolve the automatic profile without executing deployment tooling."""
+
+    if profile != "auto":
+        return profile
+    if context.has_file("Dockerfile") or context.has_file("Containerfile"):
+        return "containerized-service"
+    if any(
+        context.has_file(path)
+        for path in ("vercel.json", "netlify.toml", "render.yaml", "fly.toml", "railway.json", "railway.toml")
+    ):
+        return "web-app"
+    ecosystems = detect_ecosystems(context)
+    return "monorepo" if len(ecosystems) > 1 else "library"
+
+
+def scan(
+    root: str | Path,
+    *,
+    context: RepoContext | None = None,
+    profile: str = "legacy",
+) -> ScanReport:
     """Run one deterministic scan while retaining the caller's path string."""
 
     ctx = context or RepoContext(root)
     ecosystems = tuple(sorted(detect_ecosystems(ctx)))
-    checks = run_checks(ctx, ecosystems)
+    if profile not in {"auto", "legacy", "library", "web-app", "containerized-service", "monorepo"}:
+        raise ValueError(f"unknown scoring profile: {profile}")
+    selected_profile = resolve_profile(ctx, profile)
+    checks = run_checks(ctx, ecosystems, profile=selected_profile)
     return ScanReport(
         tool="repo-ready",
         version=__version__,
@@ -39,12 +63,22 @@ def scan(root: str | Path, *, context: RepoContext | None = None) -> ScanReport:
     )
 
 
-def report(root: str | Path, *, context: RepoContext | None = None) -> dict[str, object]:
-    return scan(root, context=context).as_dict()
+def report(
+    root: str | Path,
+    *,
+    context: RepoContext | None = None,
+    profile: str = "legacy",
+) -> dict[str, object]:
+    return scan(root, context=context, profile=profile).as_dict()
 
 
-def build_report(root: str | Path, *, context: RepoContext | None = None) -> ScanReport:
-    return scan(root, context=context)
+def build_report(
+    root: str | Path,
+    *,
+    context: RepoContext | None = None,
+    profile: str = "legacy",
+) -> ScanReport:
+    return scan(root, context=context, profile=profile)
 
 
 scan_repository = scan
@@ -71,4 +105,4 @@ def score_checks(checks: dict[str, object]) -> int:
     return sum(weight for name, weight in legacy.items() if checks.get(name) is True)
 
 
-__all__ = ["CHECK_WEIGHTS", "build_report", "evaluate_rules", "grade", "report", "scan", "scan_repository", "score_checks"]
+__all__ = ["CHECK_WEIGHTS", "build_report", "evaluate_rules", "grade", "report", "resolve_profile", "scan", "scan_repository", "score_checks"]

@@ -10,7 +10,7 @@ import tomllib
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 
-from .checks import environment_reads
+from .checks import _test_command, environment_reads
 from .context import RepoContext
 from .detector import detect_ecosystems
 from .scoring import report
@@ -87,7 +87,7 @@ _PR = """## Summary
 
 ## Verification
 
-- [ ] `python -m pytest -q` or the documented project test command
+- [ ] `{test_command}`
 """
 _MIT = """MIT License
 
@@ -266,14 +266,15 @@ def _contains_machine_path(text: str) -> bool:
     return any(pattern.search(text) for pattern in _MACHINE_PATHS)
 
 
-def _dockerfile(ecosystems: list[str], runtime: str) -> str:
+def _dockerfile(ecosystems: list[str], runtime: str, test_command: str) -> str:
     if "python" in ecosystems:
-        return f"FROM python:{runtime}-slim\n\nWORKDIR /app\nCOPY . .\nCMD [\"python\", \"-m\", \"pytest\", \"-q\"]\n"
-    return f"FROM node:{runtime}-slim\n\nWORKDIR /app\nCOPY package*.json ./\nCOPY . .\nCMD [\"npm\", \"test\"]\n"
+        command = json.dumps(test_command.split())
+        return f"FROM python:{runtime}-slim\n\nWORKDIR /app\nCOPY . .\nCMD {command}\n"
+    command = json.dumps(test_command.split())
+    return f"FROM node:{runtime}-slim\n\nWORKDIR /app\nCOPY package*.json ./\nCOPY . .\nCMD {command}\n"
 
 
-def _ci_workflow(ecosystems: list[str]) -> str:
-    command = "python -m pytest -q" if "python" in ecosystems else "npm test"
+def _ci_workflow(ecosystems: list[str], command: str) -> str:
     setup = """      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -316,6 +317,13 @@ def plan_fixes(
         # filesystem.  Showcase callers use this branch after snapshotting.
         trusted = context.root
     ecosystems = detect_ecosystems(context)
+    detected = _test_command(context)
+    if detected:
+        test_command = detected.split(" (", 1)[0]
+    elif "python" in ecosystems:
+        test_command = "python -m pytest -q"
+    else:
+        test_command = "npm test"
     plans: list[PlannedFile] = []
 
     def add(relative: str, content: str, reason: str) -> None:
@@ -381,7 +389,7 @@ def plan_fixes(
         add(".github/ISSUE_TEMPLATE/bug_report.md", _ISSUE, "issue template")
     add_if_missing(
         ".github/PULL_REQUEST_TEMPLATE.md",
-        _PR,
+        _PR.format(test_command=test_command),
         "pull-request template",
         (".github/PULL_REQUEST_TEMPLATE.md", "PULL_REQUEST_TEMPLATE.md", "docs/PULL_REQUEST_TEMPLATE.md"),
     )
@@ -451,7 +459,7 @@ def plan_fixes(
         if docker_path:
             skip_existing(docker_path, "Dockerfile")
         elif docker_runtime:
-            add("Dockerfile", _dockerfile(ecosystems, docker_runtime), "Dockerfile from detected runtime")
+            add("Dockerfile", _dockerfile(ecosystems, docker_runtime, test_command), "Dockerfile from detected runtime")
             add(".dockerignore", _DOCKERIGNORE, "Docker build context exclusions")
         else:
             plans.append(
@@ -479,7 +487,7 @@ def plan_fixes(
     if workflow_existing:
         skip_existing(workflow_existing, "CI workflow")
     else:
-        add(".github/workflows/ci.yml", _ci_workflow(ecosystems), "CI workflow")
+        add(".github/workflows/ci.yml", _ci_workflow(ecosystems, test_command), "CI workflow")
 
     plans.extend(
         (
