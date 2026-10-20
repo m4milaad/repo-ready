@@ -1,6 +1,6 @@
 """Offline repository readiness scoring."""
 
-__version__ = "0.1.0"
+from ._version import __version__
 
 from .context import ConfigError, FileEntry, RepoContext
 from .overlay import OverlayContext, SnapshotContext, snapshot_context
