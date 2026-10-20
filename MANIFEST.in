@@ -1,0 +1,3 @@
+include API_COMPATIBILITY.md
+include CHANGELOG.md
+include CONTRIBUTING.md

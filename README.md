@@ -415,3 +415,6 @@ min_score = 80
 The default scan excludes VCS directories, virtual environments, package
 vendor directories, caches, build output, and files over 1 MiB or identified as
 binary. It never executes the target repository.
+
+See [API_COMPATIBILITY.md](API_COMPATIBILITY.md) for the CLI exit-code policy,
+versioned JSON contracts, and public Python API guidance.
