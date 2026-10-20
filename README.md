@@ -379,14 +379,45 @@ runtime dependency.
 
 ## Rebuild and offline verification
 
+### Clean Linux from-scratch checklist
+
+The repository keeps its rebuild inputs in Git: pinned Python and Node runtime
+versions, Python/Node/browser/release lockfiles, a Dockerfile, `.env.example`,
+and the test suite. No real credentials or machine-specific paths are needed.
+
+From a clean Linux checkout:
+
+```sh
+git clone https://github.com/m4milaad/repo-ready.git
+cd repo-ready
+python3.12 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.lock
+python -m pip install --no-build-isolation -e .
+cp .env.example .env
+python -m pytest -q
+```
+
+The canonical project test command is `python -m pytest -q`; `make test` is a
+convenience wrapper when GNU Make is available. The optional `.env` file only
+contains local example settings and is ignored by Git.
+
+Build and run the clean packaged image:
+
 ```sh
 docker build -t repo-ready .
 docker run --rm --network none repo-ready python -m pytest -q
 docker run --rm -v "$PWD":/work repo-ready repo-ready check /work --json
 ```
 
-The Docker image has no Make dependency and its default command is
-`python -m pytest -q`. It installs the project as a wheel-equivalent
+The Dockerfile installs the project as a non-editable wheel and its default
+command is the test suite. To run the installed CLI directly:
+
+```sh
+docker run --rm --network none repo-ready repo-ready --version
+```
+
+The Docker image has no Make dependency. It installs the project as a wheel-equivalent
 non-editable package and disables the test suite's checkout-source path
 injection. `.dockerignore` keeps local virtual environments, caches, and build
 artifacts out of the build context.
