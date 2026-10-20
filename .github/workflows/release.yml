@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Expected version, for example 0.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install locked verification tools
+        run: |
+          python -m pip install -r requirements.lock
+          python -m pip install -r requirements-release.lock
+      - name: Validate release metadata
+        id: version
+        env:
+          EXPECTED_INPUT: ${{ inputs.version }}
+          TAG_VERSION: ${{ github.ref_name }}
+        run: |
+          if [ -n "$EXPECTED_INPUT" ]; then expected="$EXPECTED_INPUT"; else expected="$TAG_VERSION"; fi
+          python scripts/release_check.py "$expected"
+          echo "version=${expected#v}" >> "$GITHUB_OUTPUT"
+      - name: Run release gate
+        run: python scripts/release_gate.py "${{ steps.version.outputs.version }}" --skip-docker --skip-browser --output-dir dist/release
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts
+          path: dist/release/*
+          if-no-files-found: error
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+          path: dist/release
+      - name: Publish to PyPI with trusted publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "v${{ needs.verify.outputs.version }}" dist/release/* --generate-notes --title "repo-ready ${{ needs.verify.outputs.version }}"
