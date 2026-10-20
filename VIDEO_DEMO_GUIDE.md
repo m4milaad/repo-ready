@@ -19,6 +19,27 @@ The strongest story is:
 The report is a single HTML file. It needs no server, CDN, account, or
 internet connection.
 
+## Should you use any project?
+
+Yes. Pass the path of any local project to `repo-ready`; it scans the target
+files statically and does not run the target application, install target
+dependencies, invoke its package manager, or write into it.
+
+There are two good recording choices:
+
+1. **Your own project** — best when you want to show a real readiness score or
+   a real documentation/CI contradiction. Some Breakage Lab scenarios may be
+   unavailable if the project does not contain the contract that scenario
+   needs.
+2. **The checked-in showcase fixture** — recommended for a reliable video.
+   `examples/showcase-demo` is deterministic and enables all four simulated
+   Breakage Lab scenarios. It is not the target application; it is the
+   purpose-built demo repository shipped with this project.
+
+For the strongest submission, use the showcase fixture for the interactive
+story, then optionally run one `check` command against your own project to show
+that the CLI also works on arbitrary repositories.
+
 ## One-time setup
 
 Run these commands from the `repo-ready` checkout. Python 3.12 is the pinned
@@ -31,6 +52,15 @@ locked tools are for development and verification.
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.lock
 .\.venv\Scripts\python.exe -m pip install --no-build-isolation -e .
+```
+
+For the optional visual browser check and recording flow, install the pinned
+browser tools too:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-browser.lock
+.\.venv\Scripts\python.exe -m playwright install chromium
+npm ci
 ```
 
 ### macOS or Linux
@@ -49,6 +79,13 @@ examples:
 python -m repo_ready ...
 ```
 
+On Windows, the commands below can use the project-local interpreter without
+activating the virtual environment:
+
+```powershell
+$Python = (Resolve-Path ".\.venv\Scripts\python.exe").Path
+```
+
 ## Choose the repository to inspect
 
 Set one variable to the repository you want to show. Quote paths containing
@@ -57,7 +94,12 @@ spaces.
 ### Windows PowerShell
 
 ```powershell
+# Option A: inspect your own project.
 $Target = "C:\path\to\repository"
+
+# Option B: use the deterministic fixture for the full interactive demo.
+# $Target = (Resolve-Path ".\examples\showcase-demo").Path
+
 $Audit = Join-Path $env:TEMP "repo-ready-video"
 New-Item -ItemType Directory -Path $Audit -Force | Out-Null
 ```
@@ -74,6 +116,44 @@ Do not put generated reports inside the target when recording a clean scan.
 Keeping outputs in a separate audit directory makes the read-only behavior easy
 to demonstrate.
 
+### Recommended Windows copy-and-paste sequence
+
+This is the shortest reliable recording path. Run it from the `repo-ready`
+checkout after setup. Use the fixture first; replace the `$Target` line with
+your own project when you want to demonstrate a real repository.
+
+```powershell
+$Python = (Resolve-Path ".\.venv\Scripts\python.exe").Path
+$Target = (Resolve-Path ".\examples\showcase-demo").Path
+$Audit = Join-Path $env:TEMP "repo-ready-video"
+New-Item -ItemType Directory -Path $Audit -Force | Out-Null
+
+# 1. Show the baseline score.
+& $Python -m repo_ready check $Target --no-color
+
+# 2. Show cross-file contradictions.
+& $Python -m repo_ready diagnose $Target
+
+# 3. Generate the self-contained report outside the target project.
+$Report = Join-Path $Audit "repo-report.html"
+& $Python -m repo_ready showcase $Target --output $Report
+
+# 4. Open the report for the recording.
+Start-Process $Report
+```
+
+Inside the report, show **Observed (static)**, select a **Simulated** Breakage
+Lab scenario, inspect the evidence chain, open **Repair notes**, and download
+the receipt. The fixture makes all four scenarios available. With your own
+project, an unavailable scenario is normal and explains which contract was not
+found.
+
+Optional browser validation before recording:
+
+```powershell
+& $Python scripts\browser_smoke.py $Report
+```
+
 ## Full audit sequence for any repository
 
 Run the following sequence. Every command is safe to run against an unfamiliar
@@ -84,7 +164,7 @@ local repository.
 Human-readable output is best for the opening shot:
 
 ```powershell
-python -m repo_ready check "$Target" --no-color
+& $Python -m repo_ready check "$Target" --no-color
 ```
 
 ```sh
@@ -97,7 +177,7 @@ checks include relative file findings and repair hints.
 Save the machine-readable result for later comparison:
 
 ```powershell
-python -m repo_ready check "$Target" --json > "$Audit\readiness.json"
+& $Python -m repo_ready check "$Target" --json > "$Audit\readiness.json"
 ```
 
 ```sh
@@ -116,8 +196,8 @@ python -m repo_ready check "$TARGET" --format sarif
 This is the best command for revealing contradictions hidden by a good score:
 
 ```powershell
-python -m repo_ready diagnose "$Target"
-python -m repo_ready diagnose "$Target" --json > "$Audit\contract-graph.json"
+& $Python -m repo_ready diagnose "$Target"
+& $Python -m repo_ready diagnose "$Target" --json > "$Audit\contract-graph.json"
 ```
 
 ```sh
@@ -129,10 +209,15 @@ The graph compares README commands, Makefile recipes, manifests, lockfiles,
 runtime pins, CI workflows, and Docker instructions. It is static evidence,
 not proof that a command will succeed when executed.
 
+If `diagnose` returns exit code `1`, that means it found an error-severity
+diagnostic; it still produced the intended report. Continue to the showcase
+step. The checked-in fixture intentionally contains contradictions so this is
+useful during a recording.
+
 ### 3. Generate the interactive Repo X-Ray report
 
 ```powershell
-python -m repo_ready showcase "$Target" --output "$Audit\repo-report.html"
+& $Python -m repo_ready showcase "$Target" --output "$Audit\repo-report.html"
 ```
 
 ```sh
