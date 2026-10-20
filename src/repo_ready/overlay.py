@@ -149,6 +149,17 @@ class _FrozenContext(RepoContext):
             return None
         return self._contents.get(entry.path)
 
+    def read_indexed_bytes(self, path: str | Path | FileEntry) -> bytes | None:
+        """Read immutable indexed bytes without consulting the source tree.
+
+        Frozen contexts intentionally skip ``RepoContext.__init__`` and keep
+        their contents in ``_contents`` rather than ``_small_file_cache``.
+        The indexed-read API must therefore use the frozen view's own
+        ``read_bytes`` implementation instead of the live-context cache.
+        """
+
+        return self.read_bytes(path)
+
 
 class SnapshotContext(_FrozenContext):
     """Freeze indexed bytes once under a non-negative integer memory budget.

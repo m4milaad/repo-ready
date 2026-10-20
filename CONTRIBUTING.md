@@ -15,6 +15,18 @@ python -m pip install --no-build-isolation -e .
 The editable install provides both the `repo-ready` console script and the
 `python -m repo_ready` invocation.
 
+For the optional browser smoke gate, install its locked Python dependencies and
+Chromium, then install the locked Node browser tooling:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-browser.lock
+.\.venv\Scripts\python.exe -m playwright install chromium
+npm ci
+```
+
+The browser packages are development-only and are not needed for the standard
+offline test suite.
+
 ## Verification
 
 Run the one project test command before opening a pull request:

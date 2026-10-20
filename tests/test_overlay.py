@@ -150,6 +150,25 @@ def test_removed_stale_forged_and_foreign_entries_cannot_bypass_reads(tmp_path: 
     assert frozen.read_bytes(replace(frozen.entry("keep.txt"))) is None
 
 
+def test_repo_context_rejects_foreign_and_forged_entries(tmp_path: Path) -> None:
+    repository = _repository(tmp_path, {"keep.txt": "inside"})
+    outside_root = tmp_path / "outside-root"
+    outside_root.mkdir()
+    foreign = RepoContext(_repository(outside_root, {"keep.txt": "outside"}))
+    base = RepoContext(repository)
+    foreign_entry = foreign.entry("keep.txt")
+    forged_entry = FileEntry("keep.txt", outside_root / "secret.txt", 6)
+
+    assert foreign_entry is not None
+    for entry in (foreign_entry, forged_entry, replace(base.entry("keep.txt"))):
+        assert base.entry(entry) is None
+        assert not base.has_file(entry)
+        assert base.read_bytes(entry) is None
+        assert base.read_text(entry) is None
+
+    assert base.read_text("keep.txt") == "inside"
+
+
 def test_virtual_and_snapshot_binary_size_and_utf8_guards(tmp_path: Path) -> None:
     repository = _repository(tmp_path, {"binary": b"a\x00b", "large": b"x" * 9, "valid": "ok"})
     base = RepoContext(repository, max_file_bytes=8)

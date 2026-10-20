@@ -281,19 +281,27 @@ class RepoContext:
             too_large = size > self.max_file_bytes
             binary = False
             if not too_large:
+                descriptor = -1
                 try:
-                    with Path(item.path).open("rb") as source:
-                        sample = source.read(8192)
-                        binary = b"\x00" in sample
-                        if not binary and size <= 8192:
-                            self._small_file_cache[relative] = (
-                                size,
-                                information.st_mtime_ns,
-                                information.st_ctime_ns,
-                                sample,
-                            )
+                    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+                    descriptor = os.open(item.path, flags)
+                    sample = os.read(descriptor, 8192)
                 except OSError:
                     continue
+                finally:
+                    if descriptor >= 0:
+                        try:
+                            os.close(descriptor)
+                        except OSError:
+                            pass
+                binary = b"\x00" in sample
+                if not binary and size <= 8192:
+                    self._small_file_cache[relative] = (
+                        size,
+                        information.st_mtime_ns,
+                        information.st_ctime_ns,
+                        sample,
+                    )
             found.append(FileEntry(relative, Path(item.path), size, too_large, binary))
             self._observed_files += 1
             self._observed_bytes += size
@@ -340,7 +348,7 @@ class RepoContext:
 
     def entry(self, path: str | Path | FileEntry) -> FileEntry | None:
         if isinstance(path, FileEntry):
-            return path
+            return path if self._by_path.get(path.path) is path else None
         return self._by_path.get(_posix_path(path))
 
     def has_file(self, path: str | Path, *, readable: bool = False) -> bool:
@@ -359,7 +367,7 @@ class RepoContext:
         if cached is not None:
             cached_size, cached_mtime_ns, cached_ctime_ns, cached_data = cached
             try:
-                information = entry.absolute.stat(follow_symlinks=False)
+                information = os.stat(entry.absolute, follow_symlinks=False)
                 if (
                     stat.S_ISREG(information.st_mode)
                     and information.st_size == cached_size
@@ -417,6 +425,39 @@ class RepoContext:
         """
 
         data = self.read_bytes(path)
+        if data is None:
+            return None
+        try:
+            return data.decode("utf-8", errors=errors)
+        except (UnicodeDecodeError, LookupError):
+            return None
+
+    def read_indexed_bytes(self, path: str | Path | FileEntry) -> bytes | None:
+        """Read the bytes captured while indexing, when available.
+
+        Repository checks operate on the index snapshot. Small readable files
+        are already captured during traversal, so using those bytes avoids a
+        second metadata round-trip for broad checks while ``read_bytes`` keeps
+        its live-change detection contract for callers that need it.
+        """
+
+        entry = self.entry(path)
+        if entry is None or entry.too_large or entry.binary:
+            return None
+        cached = self._small_file_cache.get(entry.path)
+        if cached is not None:
+            return cached[3]
+        return self.read_bytes(entry)
+
+    def read_indexed_text(
+        self,
+        path: str | Path | FileEntry,
+        *,
+        errors: str = "replace",
+    ) -> str | None:
+        """Decode the indexed snapshot without rechecking cached metadata."""
+
+        data = self.read_indexed_bytes(path)
         if data is None:
             return None
         try:

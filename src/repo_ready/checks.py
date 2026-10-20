@@ -1292,7 +1292,7 @@ def environment_reads(ctx: RepoContext) -> tuple[tuple[str, int, str], ...]:
     for entry in ctx:
         if PurePosixPath(entry.path).suffix.casefold() not in _SOURCE_SUFFIXES:
             continue
-        text = ctx.read_text(entry)
+        text = ctx.read_indexed_text(entry)
         if text is None:
             continue
         for line_number, line in enumerate(text.splitlines(), 1):
@@ -1351,7 +1351,7 @@ def rr11(ctx: RepoContext) -> CheckResult:
     for entry in ctx:
         if entry.name in _LOCKFILE_NAMES or entry.path in _ENV_FILES:
             continue
-        text = ctx.read_text(entry)
+        text = ctx.read_indexed_text(entry)
         if text is None:
             continue
         for line_number, line in enumerate(text.splitlines(), 1):

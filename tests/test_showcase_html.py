@@ -12,6 +12,7 @@ import zipfile
 
 import pytest
 
+from repo_ready import __version__
 from repo_ready.scoring import report
 from repo_ready import showcase_html
 from repo_ready.showcase_html import render_showcase
@@ -71,7 +72,7 @@ def payload(tmp_path: Path) -> dict:
     return seal({
         "schema_version": 1,
         "tool": "repo-ready",
-        "tool_version": "0.1.0",
+        "tool_version": __version__,
         "analysis": {
             "repository": {"name": "field-notes", "scope": "filesystem", "files": 0, "complete": True},
             "mode": "static",
@@ -314,3 +315,13 @@ def test_invalid_envelopes_fail_explicitly(payload: dict) -> None:
     payload["analysis"]["mode"] = "execution"
     with pytest.raises(ValueError, match="static analysis"):
         render_showcase(payload)
+
+
+def test_renderer_uses_package_version_for_payload_validation(
+    payload: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(showcase_html, "__version__", "0.2.0")
+    payload["tool_version"] = "0.2.0"
+
+    assert render_showcase(payload).startswith("<!doctype html>")

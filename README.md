@@ -61,6 +61,29 @@ python -m repo_ready check .
 the same CLI through the package module. Both commands default to the current
 directory when no repository path is supplied.
 
+### Optional browser automation tooling
+
+The core CLI and standard test suite do not require browser automation. To run
+the optional visual smoke gate, install the pinned Python browser tools and
+Chromium into the local environment:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-browser.lock
+.\.venv\Scripts\python.exe -m playwright install chromium
+```
+
+The repository also includes a locked Node toolchain for browser automation.
+Install it from the root with:
+
+```powershell
+npm ci
+```
+
+This creates the ignored `node_modules/` directory and installs Playwright and
+Selenium WebDriver for Node. The Python `scripts/browser_smoke.py` gate uses the
+Python Playwright installation; Selenium is available for additional browser
+checks and is not required by the core test suite.
+
 CI and Docker use a non-editable wheel install so their test runs verify the
 packaged application rather than importing directly from `src/`. The test
 suite normally adds `src/` for convenient local checkout testing; set

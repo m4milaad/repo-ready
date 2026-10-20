@@ -14,6 +14,8 @@ from importlib import resources
 import json
 import re
 
+from . import __version__
+
 
 _SLOTS = re.compile(r"@@([A-Z_]+)@@")
 
@@ -226,8 +228,10 @@ def render_showcase(payload: dict) -> str:
     if not isinstance(payload, dict):
         raise TypeError("Showcase payload must be a dict")
     if (payload.get("schema_version") != 1 or payload.get("tool") != "repo-ready"
-            or payload.get("tool_version") != "0.1.0"):
-        raise ValueError("Expected a repo-ready 0.1.0 showcase payload with schema_version 1")
+            or payload.get("tool_version") != __version__):
+        raise ValueError(
+            f"Expected a repo-ready {__version__} showcase payload with schema_version 1"
+        )
     analysis = payload.get("analysis")
     receipt = payload.get("receipt")
     if (not isinstance(analysis, dict) or analysis.get("mode") != "static"
