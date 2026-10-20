@@ -239,7 +239,7 @@ python -m pytest -q
 On this Windows development host, the current result is:
 
 ```text
-418 passed, 4 skipped
+426 passed, 4 skipped
 ```
 
 The four skips are host-capability guards for symbolic links and named pipes.
@@ -247,7 +247,7 @@ The same suite runs without those platform limitations in the clean Linux
 Docker image:
 
 ```text
-422 passed
+430 passed
 ```
 
 The project also provides the single test wrapper:
