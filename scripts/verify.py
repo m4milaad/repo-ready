@@ -125,7 +125,7 @@ def _terminate(process: subprocess.Popen[bytes]) -> None:
         return
     try:
         os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
+    except OSError:
         try:
             process.kill()
         except OSError:
