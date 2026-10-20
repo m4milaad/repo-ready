@@ -9,6 +9,11 @@ do not silently break CI integrations.
 - `1`: the repository was checked, but a score threshold or comparison reported a regression
 - `2`: invalid path, invalid usage, invalid baseline, or configuration error
 
+`scripts/verify.py` is intentionally separate from the installed static CLI.
+It is an opt-in execution boundary, returns `0` only when the supplied or
+detected command passes, returns `1` for a failed, timed-out, or unavailable
+command, and returns `2` when verification cannot be configured.
+
 ## Stable report contracts
 
 The following are versioned public outputs:

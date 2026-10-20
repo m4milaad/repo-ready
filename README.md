@@ -152,6 +152,30 @@ integrity observations. Integrity observations (such as tracked build output,
 multiple lockfiles, or large tracked files) do not silently change the
 readiness score.
 
+### Opt-in execution verification
+
+`check` is intentionally static. When you want to run a repository's tests,
+use the separate `scripts/verify.py` command. It is opt-in, runs from the
+target repository, does not invoke a shell, and stops after a bounded timeout:
+
+```sh
+# Use the test command detected by RR09.
+python scripts/verify.py .
+
+# Or supply the exact command explicitly.
+python scripts/verify.py . --command "python -m pytest -q" --timeout 300
+
+# Save a machine-readable execution result.
+python scripts/verify.py . --command "python -m pytest -q" --json
+```
+
+The result records the command, source (`detected` or `explicit`), exit code,
+duration, bounded stdout/stderr, timeout status, and whether the output was
+truncated. A missing or nonzero test command is reported as a failed
+verification; use `--command` when RR09 cannot identify a safe default. Running
+verification can execute arbitrary project code, so only use it on repositories
+you trust.
+
 Projects may add repository-specific scan settings in `.repo-ready.toml`:
 
 ```toml
@@ -256,7 +280,7 @@ repository builds.
 Inspect a wheel or source distribution without extracting or executing it:
 
 ```sh
-repo-ready artifact dist/repo_ready-0.1.0-py3-none-any.whl --project . --json
+repo-ready artifact dist/repo_ready-0.2.0-py3-none-any.whl --project . --json
 ```
 
 The artifact report checks member paths, links, duplicate members, size
@@ -270,8 +294,8 @@ Release metadata is validated from the single version source in
 `src/repo_ready/_version.py`:
 
 ```sh
-python scripts/release_check.py v0.1.0
-python scripts/release_gate.py v0.1.0 --skip-docker --skip-browser
+python scripts/release_check.py v0.2.0
+python scripts/release_gate.py v0.2.0 --skip-docker --skip-browser
 ```
 
 The release gate builds one wheel and one source distribution, inspects both
@@ -280,7 +304,7 @@ The full gate additionally builds the pinned Docker image and runs the clean
 Linux suite:
 
 ```sh
-python scripts/release_gate.py v0.1.0
+python scripts/release_gate.py v0.2.0
 ```
 
 Tags matching `v*.*.*` are handled by `.github/workflows/release.yml`. The

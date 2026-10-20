@@ -51,8 +51,8 @@ gate builds and inspects both distribution formats, validates the showcase,
 and can include the Docker clean-room suite:
 
 ```sh
-python scripts/release_check.py v0.1.0
-python scripts/release_gate.py v0.1.0
+python scripts/release_check.py v0.2.0
+python scripts/release_gate.py v0.2.0
 ```
 
 Use `--skip-docker --skip-browser` only for a local fast pass. Production tags

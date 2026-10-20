@@ -1481,6 +1481,18 @@ def _test_command(ctx: RepoContext) -> str | None:
     return None
 
 
+def discover_test_command(ctx: RepoContext) -> str | None:
+    """Return the executable test command selected by RR09.
+
+    RR09 keeps descriptive provenance in its human-readable message.  The
+    verify command needs only the executable command, so strip that optional
+    provenance while preserving the same selection order.
+    """
+
+    selected = _test_command(ctx)
+    return selected.split(" (", 1)[0] if selected else None
+
+
 def rr09(ctx: RepoContext, ecosystems: tuple[str, ...]) -> CheckResult:
     command = _test_command(ctx)
     if command:
@@ -1683,4 +1695,14 @@ def run_checks(ctx: RepoContext, ecosystems: Iterable[str], *, profile: str = "l
     return tuple(results)
 
 
-__all__ = ["CHECK_FIXABLE", "CHECK_HINTS", "CHECK_MESSAGES", "CHECK_TITLES", "CHECK_WEIGHTS", "RULES", "environment_reads", "run_checks"]
+__all__ = [
+    "CHECK_FIXABLE",
+    "CHECK_HINTS",
+    "CHECK_MESSAGES",
+    "CHECK_TITLES",
+    "CHECK_WEIGHTS",
+    "RULES",
+    "discover_test_command",
+    "environment_reads",
+    "run_checks",
+]

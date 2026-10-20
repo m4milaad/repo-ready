@@ -11,9 +11,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_release_metadata_is_consistent() -> None:
-    messages = validate_release(ROOT, "v0.1.0")
+    messages = validate_release(ROOT, "v0.2.0")
 
-    assert messages[0] == "version: 0.1.0"
+    assert messages[0] == "version: 0.2.0"
     assert "pyproject: dynamic version configured" in messages
 
 

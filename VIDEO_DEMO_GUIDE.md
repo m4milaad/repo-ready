@@ -307,7 +307,7 @@ After building a wheel, inspect it without extracting or executing it:
 
 ```sh
 python -m pip wheel --no-deps --no-build-isolation --wheel-dir "$AUDIT/wheel" .
-python -m repo_ready artifact "$AUDIT/wheel/repo_ready-0.1.0-py3-none-any.whl" --project . --json
+python -m repo_ready artifact "$AUDIT/wheel/repo_ready-0.2.0-py3-none-any.whl" --project . --json
 ```
 
 The artifact inspector checks member paths, links, duplicate members, size
@@ -347,8 +347,8 @@ For the final submission-quality release pass, run the artifact gate after the
 standard tests:
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\release_check.py v0.1.0
-.\.venv\Scripts\python.exe scripts\release_gate.py v0.1.0
+.\.venv\Scripts\python.exe scripts\release_check.py v0.2.0
+.\.venv\Scripts\python.exe scripts\release_gate.py v0.2.0
 ```
 
 The gate verifies the wheel, source distribution, package metadata, showcase,

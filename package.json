@@ -1,6 +1,6 @@
 {
   "name": "repo-ready-browser-tooling",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Optional Node browser automation tooling for repo-ready smoke checks",
   "engines": {

@@ -1,3 +1,4 @@
 include API_COMPATIBILITY.md
 include CHANGELOG.md
 include CONTRIBUTING.md
+include scripts/verify.py

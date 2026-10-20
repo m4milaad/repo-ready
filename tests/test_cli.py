@@ -31,6 +31,7 @@ def fixture_repo(case: str) -> Path:
 
 def expected(case: str) -> dict[str, object]:
     value = json.loads((FIXTURES / case / "expected.json").read_text(encoding="utf-8"))
+    value["version"] = __version__
     for item in value["checks"]:
         if item["status"] in {"pass", "na"}:
             item["fix_hint"] = None
