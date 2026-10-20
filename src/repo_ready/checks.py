@@ -16,6 +16,12 @@ from pathlib import PurePosixPath
 from typing import Callable, Iterable
 
 from .context import RepoContext
+from .ecosystems import (
+    conventional_test_command,
+    declared_dependencies,
+    profile_for,
+    runtime_values,
+)
 from .models import CheckResult, Finding
 
 
@@ -531,24 +537,27 @@ def _dependencies(ctx: RepoContext, ecosystem: str) -> bool:
             isinstance(pipfile.get(name), dict) and bool(pipfile[name])
             for name in ("packages", "dev-packages")
         )
-    package = _json(ctx, "package.json") if ctx.has_file("package.json") else None
-    if ctx.has_file("package.json") and package is None:
-        return True
-    if not isinstance(package, dict):
-        return False
-    for name in (*_DEPENDENCY_GROUPS, "bundledDependencies", "bundleDependencies"):
-        if name not in package:
-            continue
-        value = package[name]
-        if isinstance(value, dict):
-            if value:
-                return True
-        elif isinstance(value, list):
-            if value:
-                return True
-        elif value is not None:
+    if ecosystem == "node":
+        package = _json(ctx, "package.json") if ctx.has_file("package.json") else None
+        if ctx.has_file("package.json") and package is None:
             return True
-    return False
+        if not isinstance(package, dict):
+            return False
+        for name in (*_DEPENDENCY_GROUPS, "bundledDependencies", "bundleDependencies"):
+            if name not in package:
+                continue
+            value = package[name]
+            if isinstance(value, dict):
+                if value:
+                    return True
+            elif isinstance(value, list):
+                if value:
+                    return True
+            elif value is not None:
+                return True
+        return False
+    known, names = declared_dependencies(ctx, ecosystem)
+    return not known or bool(names)
 
 
 def _setup_cfg_parser(text: str | None) -> configparser.RawConfigParser | None:
@@ -657,10 +666,19 @@ def _lock_paths(ctx: RepoContext, ecosystem: str) -> tuple[str, ...]:
             if ctx.has_file(name):
                 return (name,)
         return tuple(requirements)
-    for name in ("package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml"):
-        if ctx.has_file(name):
-            return (name,)
-    return ()
+    if ecosystem == "node":
+        for name in ("package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml"):
+            if ctx.has_file(name):
+                return (name,)
+        return ()
+    profile = profile_for(ecosystem)
+    if profile is None:
+        return ()
+    return tuple(
+        entry.path
+        for entry in ctx
+        if any(entry.path == pattern or re.fullmatch(pattern.replace("*", ".*"), entry.path) for pattern in profile.lock_files)
+    )
 
 
 def _python_declared_names(ctx: RepoContext) -> set[str]:
@@ -716,6 +734,11 @@ def _node_declared_names(ctx: RepoContext) -> set[str]:
         values = package.get(group)
         if isinstance(values, list):
             names.update(str(name) for name in values)
+    return names
+
+
+def _generic_declared_names(ctx: RepoContext, ecosystem: str) -> set[str]:
+    _known, names = declared_dependencies(ctx, ecosystem)
     return names
 
 
@@ -933,6 +956,49 @@ def _valid_pnpm_lock(text: str | None, declared: set[str]) -> tuple[bool, str]:
     return True, ""
 
 
+def _valid_generic_lock(ctx: RepoContext, path: str, ecosystem: str, declared: set[str]) -> tuple[bool, str]:
+    text = ctx.read_text(path)
+    if text is None or not text.strip():
+        return False, f"{path} is empty or unreadable."
+    covered: set[str] = set()
+    if ecosystem == "go":
+        for line in text.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and not line.lstrip().startswith("#"):
+                covered.add(parts[0].casefold())
+    elif ecosystem == "rust":
+        document = _toml(ctx, path)
+        packages = document.get("package") if document else None
+        if not isinstance(packages, list) or not packages:
+            return False, "Cargo.lock must contain package records."
+        for package in packages:
+            if not isinstance(package, dict) or not _nonempty_string(package.get("name")) or not _nonempty_string(package.get("version")):
+                return False, "Cargo.lock package records need name and version."
+            covered.add(str(package["name"]).casefold())
+    elif ecosystem == "dotnet":
+        value = _json(ctx, path)
+        dependencies = value.get("dependencies") if value else None
+        if not isinstance(dependencies, dict) or not dependencies:
+            return False, "packages.lock.json needs dependency records."
+        for framework in dependencies.values():
+            if isinstance(framework, dict):
+                covered.update(str(name).casefold() for name in framework)
+    elif ecosystem == "java":
+        for line in text.splitlines():
+            match = re.match(r"\s*([^:#=\s]+:[^:#=\s]+):[^=\s]+\s*=", line)
+            if match:
+                covered.add(match.group(1).casefold())
+    elif ecosystem == "ruby":
+        for line in text.splitlines():
+            match = re.match(r"\s{2,}([A-Za-z0-9_.-]+)\s+\([^)]*\)", line)
+            if match:
+                covered.add(match.group(1).casefold())
+    missing = sorted(name for name in declared if name not in covered)
+    if missing:
+        return False, f"{path} does not cover declared dependencies: {', '.join(missing)}."
+    return True, ""
+
+
 def selector_name(selector: str) -> str | None:
     selector = selector.strip().strip('"\'')
     if selector.startswith("@"):
@@ -976,6 +1042,8 @@ def _validate_lock(ctx: RepoContext, path: str, ecosystem: str, declared: set[st
         return (not missing, f"{path} does not cover declared dependencies: {', '.join(missing)}." if missing else "")
     if path == "yarn.lock":
         return _valid_yarn_lock(ctx.read_text(path), declared)
+    if ecosystem in {"go", "rust", "dotnet", "java", "ruby"}:
+        return _valid_generic_lock(ctx, path, ecosystem, declared)
     return _valid_pnpm_lock(ctx.read_text(path), declared)
 
 
@@ -983,7 +1051,12 @@ def _lock_status(ctx: RepoContext, ecosystem: str) -> tuple[bool | None, list[Fi
     if not _dependencies(ctx, ecosystem):
         return None, []
     paths = _lock_paths(ctx, ecosystem)
-    declared = _python_declared_names(ctx) if ecosystem == "python" else _node_declared_names(ctx)
+    if ecosystem == "python":
+        declared = _python_declared_names(ctx)
+    elif ecosystem == "node":
+        declared = _node_declared_names(ctx)
+    else:
+        declared = _generic_declared_names(ctx, ecosystem)
     if not paths:
         return False, [_finding(".", f"{ecosystem.title()} dependencies are declared but no supported lockfile was found.")]
     findings: list[Finding] = []
@@ -1038,17 +1111,25 @@ def _runtime_ok(ctx: RepoContext, ecosystem: str) -> bool:
                 return True
         tools = ctx.read_text(".tool-versions")
         return bool(tools and re.search(r"(?m)^\s*python\s+\d+\.\d+(?:\.\d+)?\s*(?:#.*)?$", tools))
-    for name in (".nvmrc", ".node-version"):
-        value = ctx.read_text(name)
-        if value and re.fullmatch(r"\s*v?\d+(?:\.\d+){0,2}\s*", value):
+    if ecosystem == "node":
+        for name in (".nvmrc", ".node-version"):
+            value = ctx.read_text(name)
+            if value and re.fullmatch(r"\s*v?\d+(?:\.\d+){0,2}\s*", value):
+                return True
+        package = _json(ctx, "package.json") or {}
+        engines = package.get("engines")
+        node_engine = engines.get("node") if isinstance(engines, dict) else None
+        if isinstance(node_engine, str) and re.fullmatch(r"\s*v?\d+(?:\.\d+){0,2}\s*", node_engine):
             return True
-    package = _json(ctx, "package.json") or {}
-    engines = package.get("engines")
-    node_engine = engines.get("node") if isinstance(engines, dict) else None
-    if isinstance(node_engine, str) and re.fullmatch(r"\s*v?\d+(?:\.\d+){0,2}\s*", node_engine):
-        return True
-    tools = ctx.read_text(".tool-versions")
-    return bool(tools and re.search(r"(?m)^\s*nodejs\s+v?\d+(?:\.\d+){0,2}\s*(?:#.*)?$", tools))
+        tools = ctx.read_text(".tool-versions")
+        return bool(tools and re.search(r"(?m)^\s*nodejs\s+v?\d+(?:\.\d+){0,2}\s*(?:#.*)?$", tools))
+    profile = profile_for(ecosystem)
+    if profile is None:
+        return False
+    for _path, value, _line in runtime_values(ctx, ecosystem):
+        if re.search(r"\d", value):
+            return True
+    return False
 
 
 def rr07(ctx: RepoContext, ecosystems: tuple[str, ...]) -> CheckResult:
@@ -1269,7 +1350,13 @@ def _test_command(ctx: RepoContext) -> str | None:
         if isinstance(command, str) and command.strip() and "no test specified" not in command.casefold():
             return f"npm test (package.json scripts.test: {command.strip()})"
 
-    return _config_test_command(ctx)
+    configured = _config_test_command(ctx)
+    if configured:
+        return configured
+    for profile in (profile_for(name) for name in ("go", "rust", "dotnet", "java", "ruby")):
+        if profile is not None and profile.matches(ctx):
+            return conventional_test_command(ctx, profile.name)
+    return None
 
 
 def rr09(ctx: RepoContext, ecosystems: tuple[str, ...]) -> CheckResult:
@@ -1281,10 +1368,15 @@ def rr09(ctx: RepoContext, ecosystems: tuple[str, ...]) -> CheckResult:
 
 
 _ENV_FILES = (".env.example", ".env.sample", ".env.template")
-_SOURCE_SUFFIXES = {".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}
+_SOURCE_SUFFIXES = {".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".go", ".rs", ".cs", ".fs", ".vb", ".java", ".kt", ".kts", ".rb", ".rake"}
 _ENV_NAME = r"[A-Z_][A-Z0-9_]*"
 _PY_ENV = re.compile(r"\bos\.(?:environ(?:\.get)?|getenv)\s*(?:\[\s*[\"'](" + _ENV_NAME + r")[\"']|\(\s*[\"'](" + _ENV_NAME + r")[\"'])")
 _NODE_ENV = re.compile(r"\bprocess\.env(?:\.((?:" + _ENV_NAME + r"))|\[\s*[\"'](" + _ENV_NAME + r")[\"'])")
+_GO_ENV = re.compile(r"\bos\.Getenv\s*\(\s*[\"'](" + _ENV_NAME + r")[\"']\s*\)")
+_RUST_ENV = re.compile(r"\bstd::env::var(?:_os)?\s*\(\s*[\"'](" + _ENV_NAME + r")[\"']\s*\)")
+_DOTNET_ENV = re.compile(r"\bEnvironment\.GetEnvironmentVariable\s*\(\s*[\"'](" + _ENV_NAME + r")[\"']\s*\)")
+_JAVA_ENV = re.compile(r"\bSystem\.getenv\s*\(\s*[\"'](" + _ENV_NAME + r")[\"']\s*\)")
+_RUBY_ENV = re.compile(r"\bENV(?:\[|\.fetch\s*\(\s*)[\"'](" + _ENV_NAME + r")[\"']")
 
 
 def environment_reads(ctx: RepoContext) -> tuple[tuple[str, int, str], ...]:
@@ -1296,7 +1388,7 @@ def environment_reads(ctx: RepoContext) -> tuple[tuple[str, int, str], ...]:
         if text is None:
             continue
         for line_number, line in enumerate(text.splitlines(), 1):
-            for pattern in (_PY_ENV, _NODE_ENV):
+            for pattern in (_PY_ENV, _NODE_ENV, _GO_ENV, _RUST_ENV, _DOTNET_ENV, _JAVA_ENV, _RUBY_ENV):
                 match = pattern.search(line)
                 if match:
                     name = next((group for group in match.groups() if group), None)
@@ -1373,6 +1465,14 @@ def rr12(ctx: RepoContext, ecosystems: tuple[str, ...]) -> CheckResult:
         basics_ok = basics_ok and any("__pycache__" in line or ".venv" in line for line in lines)
     if "node" in ecosystems:
         basics_ok = basics_ok and any("node_modules" in line for line in lines)
+    for ecosystem in ecosystems:
+        profile = profile_for(ecosystem)
+        if profile is None or ecosystem in {"python", "node"}:
+            continue
+        basics_ok = basics_ok and any(
+            any(name.casefold() in line.casefold() for name in profile.ignore_names)
+            for line in lines
+        )
     if not ecosystems:
         basics_ok = False
     if env_ok and basics_ok:

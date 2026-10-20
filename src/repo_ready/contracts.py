@@ -29,6 +29,12 @@ from .checks import (
 )
 from .context import RepoContext
 from .detector import detect_ecosystems
+from .ecosystems import (
+    ECOSYSTEM_PROFILES,
+    conventional_test_command,
+    declared_dependencies,
+    runtime_values,
+)
 
 
 EvidenceKind = Literal[
@@ -145,9 +151,15 @@ _COMMAND_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("npm-test", re.compile(r"^npm\s+(?:run\s+)?test(?:\s|$)")),
     ("yarn-test", re.compile(r"^yarn\s+test(?:\s|$)")),
     ("pnpm-test", re.compile(r"^pnpm\s+(?:run\s+)?test(?:\s|$)")),
+    ("go-test", re.compile(r"^go\s+test(?:\s|$)")),
+    ("rust-test", re.compile(r"^(?:cargo|cargo-nextest)\s+test(?:\s|$)")),
+    ("dotnet-test", re.compile(r"^dotnet\s+test(?:\s|$)")),
+    ("maven-test", re.compile(r"^(?:\.\/)?mvn(?:w)?\s+test(?:\s|$)")),
+    ("gradle-test", re.compile(r"^(?:\.\/)?gradlew?\s+test(?:\s|$)")),
+    ("ruby-test", re.compile(r"^bundle\s+exec\s+(?:rake\s+test|rspec)(?:\s|$)")),
 )
 _INSTALL_COMMANDS = re.compile(
-    r"^(?:python(?:3(?:\.\d+)?)?\s+-m\s+pip|pip|npm|yarn|pnpm|uv|poetry)\s+(?:install|ci|sync)\b"
+    r"^(?:python(?:3(?:\.\d+)?)?\s+-m\s+pip|pip|npm|yarn|pnpm|uv|poetry|go|cargo|dotnet)\s+(?:install|ci|sync|download|fetch|restore|mod\s+download)\b"
 )
 _RUNTIME_VERSION = re.compile(r"(?<!\d)(\d+)(?:\.(\d+))?(?:\.(\d+))?(?!\d)")
 _PYTHON_FILES = (".python-version", "runtime.txt")
@@ -405,6 +417,47 @@ def _collect_manifests(context: RepoContext, ecosystems: tuple[str, ...], eviden
                         attributes=_attrs(ecosystem="node", group=group, name=name, spec=spec),
                     )
 
+    for ecosystem in ecosystems:
+        if ecosystem in {"python", "node"}:
+            continue
+        known, dependencies = declared_dependencies(context, ecosystem)
+        if not known:
+            continue
+        profile = next((item for item in ECOSYSTEM_PROFILES if item.name == ecosystem), None)
+        if profile is None:
+            continue
+        manifest = next(
+            (entry.path for entry in context if any(
+                entry.path == marker or fnmatch.fnmatchcase(entry.path, marker)
+                for marker in profile.marker_files
+            )),
+            profile.marker_files[0],
+        )
+        for name in sorted(dependencies):
+            _add_evidence(
+                evidence,
+                kind="dependency",
+                subject=f"{ecosystem}:{name}",
+                file=manifest,
+                line=1,
+                value=name,
+                normalized=name,
+                attributes=_attrs(ecosystem=ecosystem, name=name),
+            )
+        command = conventional_test_command(context, ecosystem)
+        if command:
+            family = _command_family(command)
+            if family:
+                _add_evidence(
+                    evidence,
+                    kind="command",
+                    subject=f"{ecosystem}-test",
+                    file=manifest,
+                    line=1,
+                    value=command,
+                    normalized=family,
+                    attributes=_attrs(source="ecosystem-profile", ecosystem=ecosystem, family=family),
+                )
     document = _manifest_toml(context)
     if document is not None:
         project = document.get("project")
@@ -500,6 +553,20 @@ def _collect_runtime(context: RepoContext, ecosystems: tuple[str, ...], evidence
                             normalized=value,
                             attributes=_attrs(ecosystem=ecosystem, source=".tool-versions", role="pin"),
                         )
+    for ecosystem in ecosystems:
+        if ecosystem in {"python", "node"}:
+            continue
+        for path, value, line in runtime_values(context, ecosystem):
+            _add_evidence(
+                evidence,
+                kind="runtime",
+                subject=f"pin-{ecosystem}",
+                file=path,
+                line=line,
+                value=value,
+                normalized=_runtime_version(value, node=False) or value,
+                attributes=_attrs(ecosystem=ecosystem, source=path, role="pin"),
+            )
 
 
 def _collect_workflows(context: RepoContext, evidence: list[Evidence]) -> None:
@@ -552,6 +619,26 @@ def _collect_workflows(context: RepoContext, evidence: list[Evidence]) -> None:
                     normalized=_runtime_version(value, node=True) or value,
                     attributes=_attrs(ecosystem="node", source="workflow", role="ci", constraint=value),
                 )
+            for ecosystem, field in (
+                ("go", "go-version"),
+                ("rust", "rust-version"),
+                ("dotnet", "dotnet-version"),
+                ("java", "java-version"),
+                ("ruby", "ruby-version"),
+            ):
+                setup = re.match(rf"^\s*(?:-\s+)?{re.escape(field)}:\s*(.+?)\s*$", line)
+                if setup:
+                    value = setup.group(1).split(" #", 1)[0].strip().strip("\"'")
+                    _add_evidence(
+                        evidence,
+                        kind="runtime",
+                        subject=f"ci-{ecosystem}",
+                        file=entry.path,
+                        line=number,
+                        value=value,
+                        normalized=_runtime_version(value) or value,
+                        attributes=_attrs(ecosystem=ecosystem, source="workflow", role="ci", constraint=value),
+                    )
             run = re.match(r"^\s*(?:-\s+)?run:\s*(.*?)\s*$", line)
             if steps_indent is None or field_indent is None or line.find("run:") != field_indent:
                 run = None
@@ -599,8 +686,12 @@ def _collect_docker(context: RepoContext, evidence: list[Evidence]) -> None:
         if instruction == "FROM":
             image = _docker_image(body)
             if image:
-                runtime = _runtime_version(image, node=image.casefold().startswith("node"))
-                ecosystem = "node" if image.casefold().startswith("node") else "python" if image.casefold().startswith("python") else ""
+                ecosystem = ""
+                for profile in ECOSYSTEM_PROFILES:
+                    if any(image.casefold().startswith(prefix.casefold()) for prefix in profile.container_prefixes):
+                        ecosystem = profile.name
+                        break
+                runtime = _runtime_version(image, node=ecosystem == "node")
                 _add_evidence(
                     evidence,
                     kind="container",
@@ -720,6 +811,20 @@ def _collect_locks(context: RepoContext, evidence: list[Evidence]) -> None:
                 normalized=entry.path,
                 attributes=_attrs(source="filesystem", role="requirements-lock"),
             )
+    for profile in ECOSYSTEM_PROFILES:
+        for name in _lock_paths(context, profile.name):
+            entry = context.entry(name)
+            if entry is not None:
+                _add_evidence(
+                    evidence,
+                    kind="lockfile",
+                    subject=f"lock:{name}",
+                    file=name,
+                    line=1,
+                    value=name,
+                    normalized=name,
+                    attributes=_attrs(source="filesystem", role="lockfile", ecosystem=profile.name),
+                )
 
 
 def _by_subject(evidence: Iterable[Evidence], prefix: str, *, kind: EvidenceKind | None = None) -> list[Evidence]:
@@ -992,7 +1097,7 @@ def _link_runtimes(
     edges: list[ContractEdge],
     diagnostics: list[ContractDiagnostic],
 ) -> None:
-    for ecosystem in ("python", "node"):
+    for ecosystem in tuple(profile.name for profile in ECOSYSTEM_PROFILES):
         pins = [item for item in evidence if item.kind == "runtime" and item.subject.startswith("pin-") and dict(item.attributes).get("ecosystem") == ecosystem]
         if not pins:
             continue
@@ -1036,7 +1141,10 @@ def _link_dependencies(
     diagnostics: list[ContractDiagnostic],
 ) -> None:
     locks = [item for item in evidence if item.kind == "lockfile"]
-    selected = {ecosystem: _lock_paths(context, ecosystem) for ecosystem in ("python", "node")}
+    selected = {
+        ecosystem: _lock_paths(context, ecosystem)
+        for ecosystem in tuple(profile.name for profile in ECOSYSTEM_PROFILES)
+    }
     validation: dict[tuple[str, str], tuple[bool, str]] = {}
     for dependency in (item for item in evidence if item.kind == "dependency"):
         attrs = dict(dependency.attributes)

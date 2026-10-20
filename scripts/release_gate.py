@@ -73,6 +73,7 @@ def run_gate(
         )
     for artifact in (wheels[0], sdists[0]):
         _inspect(artifact, repository)
+    _run(_command("-m", "twine", "check", str(wheels[0]), str(sdists[0])), cwd=repository)
 
     _run(_command("scripts/showcase_smoke.py"), cwd=repository)
     if not skip_browser:

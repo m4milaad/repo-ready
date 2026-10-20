@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Protocol
 
 from .context import RepoContext
+from .ecosystems import ECOSYSTEM_PROFILES
 
 
 class EcosystemDetector(Protocol):
@@ -45,24 +46,11 @@ class MarkerFileDetector:
         return self.detect(root)
 
 
-# Keep this sequence ordered: Python is deliberately detected before Node.
-ECOSYSTEM_DETECTORS: tuple[EcosystemDetector, ...] = (
-    MarkerFileDetector(
-        "python",
-        (
-            "pyproject.toml",
-            "requirements*.txt",
-            "setup.py",
-            "setup.cfg",
-            "Pipfile",
-        ),
-    ),
-    MarkerFileDetector(
-        "node",
-        (
-            "package.json",
-        ),
-    ),
+# Keep this sequence ordered so reports remain deterministic across
+# multi-language repositories.
+ECOSYSTEM_DETECTORS: tuple[EcosystemDetector, ...] = tuple(
+    MarkerFileDetector(profile.name, profile.marker_files)
+    for profile in ECOSYSTEM_PROFILES
 )
 
 
